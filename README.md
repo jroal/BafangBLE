@@ -4,4 +4,4 @@ I have this device: https://docs.waveshare.com/ESP32-S3-Touch-LCD-4.3B I plan to
 
 <img width="773" height="1115" alt="BafangHarness" src="https://github.com/user-attachments/assets/55e24e31-ce58-4dcb-850c-e3053cf17a15" />
 
-I plan to make a TY harness to connect the device at the display connector. I bought this power step-down convertor: https://www.amazon.com/dp/B0FSDSVJC1 to support this project.
+I plan to make a T harness to connect the device at the display connector. I bought this power step-down convertor: https://www.amazon.com/dp/B0FSDSVJC1 to support this project. 
