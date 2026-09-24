@@ -1,5 +1,8 @@
 #include <Arduino.h>
+#include <driver/i2c.h>
 #include <driver/twai.h>    // ESP32 native CAN driver (Bafang M620 uses CAN)
+#include <SD.h>
+#include <SPI.h>
 #include <ESP_Panel_Library.h>
 #include <esp_heap_caps.h>
 #include <BLEDevice.h>
@@ -34,6 +37,16 @@ static const uint32_t CAN_ID_MOTOR_POWER = 0x301;  // power, torque, motor temp
 static const uint32_t CAN_ID_BATTERY_STATUS = 0x310; // voltage, current, state of charge
 
 static const unsigned long BLE_NOTIFY_INTERVAL_MS = 500;
+static const unsigned long SD_LOG_FLUSH_INTERVAL_MS = 1000;
+
+// Waveshare ESP32-S3-Touch-LCD-4.3B onboard TF-card SPI wiring.
+static const int SD_SPI_SCK_PIN = 12;
+static const int SD_SPI_MISO_PIN = 13;
+static const int SD_SPI_MOSI_PIN = 11;
+static const int SD_CARD_CS = -1; // CS is controlled by the CH422G expander.
+static const uint8_t SD_EXPANDER_CS_PIN = 4;
+static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
+static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
 
 #define BLE_SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TELEMETRY_CHAR_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -61,6 +74,16 @@ struct BleTelemetryPacket {
 
 TaskHandle_t CANTaskHandle = NULL;
 TaskHandle_t UITaskHandle = NULL;
+TaskHandle_t SDLoggerTaskHandle = NULL;
+
+struct CanLogRecord {
+    uint32_t timestampMs;
+    twai_message_t message;
+};
+
+QueueHandle_t canLogQueue = NULL;
+File canLogFile;
+bool sdLoggingEnabled = false;
 
 // =========================================================================
 // DISPLAY / LVGL
@@ -105,6 +128,69 @@ static bool hardware_display_init() {
     lv_display_set_flush_cb(hardwareDisplay, hardware_flush_cb);
     lv_display_set_default(hardwareDisplay);
     return true;
+}
+
+static bool sd_log_init() {
+    uint8_t outputLevels = static_cast<uint8_t>(~(1U << SD_EXPANDER_CS_PIN));
+    if (i2c_master_write_to_device(I2C_NUM_0, CH422G_IO_WRITE_ADDRESS, &outputLevels,
+                                   sizeof(outputLevels), pdMS_TO_TICKS(10)) != ESP_OK) {
+        Serial.println("SD: expander initialization failed");
+        return false;
+    }
+
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CARD_CS);
+    if (!SD.begin(SD_CARD_CS)) {
+        Serial.println("SD: mount failed; CAN capture disabled");
+        return false;
+    }
+
+    canLogFile = SD.open(CAN_LOG_PATH, FILE_APPEND);
+    if (!canLogFile) {
+        Serial.println("SD: failed to open CAN capture file");
+        return false;
+    }
+
+    if (canLogFile.size() == 0) {
+        canLogFile.println("timestamp_ms,can_id,extended,dlc,data0,data1,data2,data3,data4,data5,data6,data7");
+    }
+    canLogFile.printf("# capture started at %lu ms\n", millis());
+    canLogFile.flush();
+    sdLoggingEnabled = true;
+    Serial.printf("SD: logging raw CAN frames to %s\n", CAN_LOG_PATH);
+    return true;
+}
+
+static void queue_can_log(const twai_message_t &message) {
+    if (!sdLoggingEnabled) {
+        return;
+    }
+
+    CanLogRecord record = {millis(), message};
+    xQueueSend(canLogQueue, &record, 0);
+}
+
+static void SDLoggerLoop(void *) {
+    unsigned long lastFlush = millis();
+    CanLogRecord record;
+
+    while (true) {
+        if (xQueueReceive(canLogQueue, &record, pdMS_TO_TICKS(100)) == pdTRUE) {
+            const twai_message_t &message = record.message;
+            canLogFile.printf(
+                "%lu,0x%03lX,%u,%u,%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\n",
+                record.timestampMs,
+                static_cast<unsigned long>(message.identifier),
+                message.extd ? 1 : 0,
+                message.data_length_code,
+                message.data[0], message.data[1], message.data[2], message.data[3],
+                message.data[4], message.data[5], message.data[6], message.data[7]);
+        }
+
+        if (millis() - lastFlush >= SD_LOG_FLUSH_INTERVAL_MS) {
+            canLogFile.flush();
+            lastFlush = millis();
+        }
+    }
 }
 
 // =========================================================================
@@ -208,6 +294,7 @@ void CANProcessingLoop(void *pvParameters) {
     while (true) {
         twai_message_t rx_msg;
         if (twai_receive(&rx_msg, pdMS_TO_TICKS(50)) == ESP_OK) {
+            queue_can_log(rx_msg);
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             lastValidFrame = millis();
             liveData.canActive = true;
@@ -279,10 +366,21 @@ void setup() {
         Serial.println("DISPLAY: initialization failed");
     } else {
         create_dashboard();
+        sd_log_init();
+    }
+
+    canLogQueue = xQueueCreate(256, sizeof(CanLogRecord));
+    if (sdLoggingEnabled && canLogQueue == NULL) {
+        Serial.println("SD: CAN capture queue allocation failed");
+        sdLoggingEnabled = false;
+        canLogFile.close();
     }
 
     xTaskCreatePinnedToCore(CANProcessingLoop, "CANTask", 4096, NULL, 1, &CANTaskHandle, 0);
     xTaskCreatePinnedToCore(UIProcessingLoop, "UITask", 8192, NULL, 1, &UITaskHandle, 1);
+    if (sdLoggingEnabled) {
+        xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 1, &SDLoggerTaskHandle, 1);
+    }
 }
 
 void loop() {

@@ -38,7 +38,7 @@ void create_dashboard() {
     power_label = lv_label_create(screen);
     lv_obj_add_style(power_label, &style_header, 0);
     lv_obj_align(power_label, LV_ALIGN_CENTER, -260, -40);
-    lv_label_set_text(power_label, "0 W");
+        lv_label_set_text(power_label, "Motor power: 0 W");
 
     cadence_label = lv_label_create(screen);
     lv_obj_add_style(cadence_label, &style_header, 0);
@@ -71,7 +71,7 @@ void update_dashboard(const MotorMetrics &metrics) {
 
     snprintf(buf, sizeof(buf), "%.1f km/h", metrics.speedKmh);
     lv_label_set_text(speed_label, buf);
-    snprintf(buf, sizeof(buf), "%u W", metrics.powerWatts);
+    snprintf(buf, sizeof(buf), "Motor power: %u W", metrics.powerWatts);
     lv_label_set_text(power_label, buf);
     snprintf(buf, sizeof(buf), "%u RPM", metrics.cadenceRpm);
     lv_label_set_text(cadence_label, buf);
