@@ -239,6 +239,12 @@ static void queue_can_log(const twai_message_t &message) {
 }
 
 static void SDLoggerLoop(void *) {
+    canLogQueue = xQueueCreate(256, sizeof(CanLogRecord));
+    if (canLogQueue == NULL || !sd_log_init()) {
+        vTaskDelete(NULL);
+        return;
+    }
+
     unsigned long lastFlush = millis();
     CanLogRecord record;
 
@@ -444,22 +450,14 @@ void setup() {
         Serial.println("DISPLAY: initialization failed");
     } else {
         create_dashboard();
-        sd_log_init();
-    }
-
-    canLogQueue = xQueueCreate(256, sizeof(CanLogRecord));
-    if (sdLoggingEnabled && canLogQueue == NULL) {
-        Serial.println("SD: CAN capture queue allocation failed");
-        sdLoggingEnabled = false;
-        canLogFile.close();
     }
 
     xTaskCreatePinnedToCore(CANProcessingLoop, "CANTask", 4096, NULL, 1, &CANTaskHandle, 0);
     xTaskCreatePinnedToCore(TouchProcessingLoop, "TouchTask", 3072, NULL, 1, &TouchTaskHandle, 0);
     xTaskCreatePinnedToCore(UIProcessingLoop, "UITask", 8192, NULL, 1, &UITaskHandle, 1);
-    if (sdLoggingEnabled) {
-        xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 1, &SDLoggerTaskHandle, 1);
-    }
+    // Runs its own SD.begin() - kept off the boot path since a slow/stuck card must not
+    // delay UITask startup (previously froze the whole boot with no display ever drawn).
+    xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 1, &SDLoggerTaskHandle, 1);
 }
 
 void loop() {
