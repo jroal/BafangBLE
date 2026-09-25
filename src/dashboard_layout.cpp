@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <lvgl.h>
 
 LV_FONT_DECLARE(lv_font_montserrat_24);
@@ -75,9 +76,13 @@ void refresh_clock_label() {
     if (clock_label == nullptr) {
         return;
     }
+    static char lastText[32] = "";
     char buf[32];
     format_epoch(current_epoch_seconds(), buf, sizeof(buf));
-    lv_label_set_text(clock_label, buf);
+    if (strcmp(buf, lastText) != 0) {
+        lv_label_set_text(clock_label, buf);
+        strcpy(lastText, buf);
+    }
 }
 
 void close_time_settings_overlay() {
@@ -237,6 +242,17 @@ void open_time_settings_overlay(lv_event_t *) {
     lv_obj_center(set_label);
     lv_obj_add_event_cb(set_btn, apply_time_settings_cb, LV_EVENT_CLICKED, nullptr);
 }
+
+// Only touches a label's text when the formatted string actually changed - calling
+// lv_label_set_text unconditionally every loop invalidates/redraws it constantly,
+// which visibly jitters the RGB LCD (same root cause fixed in the 701display project).
+void set_label_if_changed(lv_obj_t *label, char *lastText, size_t lastTextSize, const char *newText) {
+    if (strcmp(newText, lastText) != 0) {
+        lv_label_set_text(label, newText);
+        strncpy(lastText, newText, lastTextSize - 1);
+        lastText[lastTextSize - 1] = '\0';
+    }
+}
 } // namespace
 
 void create_dashboard() {
@@ -300,22 +316,33 @@ void create_dashboard() {
     refresh_clock_label();
 }
 
+// Only touches a label's text when the formatted string actually changed - calling
+// lv_label_set_text unconditionally every loop invalidates/redraws it constantly,
+// which visibly jitters the RGB LCD (same root cause fixed in the 701display project).
 void update_dashboard(const MotorMetrics &metrics) {
+    static char lastSpeed[32] = "";
+    static char lastPower[32] = "";
+    static char lastCadence[32] = "";
+    static char lastAssist[32] = "";
+    static char lastBattery[32] = "";
+    static char lastTemp[32] = "";
+    static char lastStatus[32] = "";
     char buf[32];
 
     snprintf(buf, sizeof(buf), "%.1f km/h", metrics.speedKmh);
-    lv_label_set_text(speed_label, buf);
+    set_label_if_changed(speed_label, lastSpeed, sizeof(lastSpeed), buf);
     snprintf(buf, sizeof(buf), "Motor power: %u W", metrics.powerWatts);
-    lv_label_set_text(power_label, buf);
+    set_label_if_changed(power_label, lastPower, sizeof(lastPower), buf);
     snprintf(buf, sizeof(buf), "Pedal cadence: %u RPM", metrics.cadenceRpm);
-    lv_label_set_text(cadence_label, buf);
+    set_label_if_changed(cadence_label, lastCadence, sizeof(lastCadence), buf);
     snprintf(buf, sizeof(buf), "Assist %u", metrics.assistLevel);
-    lv_label_set_text(assist_label, buf);
+    set_label_if_changed(assist_label, lastAssist, sizeof(lastAssist), buf);
     snprintf(buf, sizeof(buf), "Battery: %u%% / %.1fV", metrics.batterySocPercent, metrics.batteryVoltage);
-    lv_label_set_text(battery_label, buf);
+    set_label_if_changed(battery_label, lastBattery, sizeof(lastBattery), buf);
     snprintf(buf, sizeof(buf), "Motor temp: %d C", metrics.motorTempC);
-    lv_label_set_text(temp_label, buf);
-    lv_label_set_text(status_label, metrics.canActive ? "CAN: active" : "CAN: no data");
+    set_label_if_changed(temp_label, lastTemp, sizeof(lastTemp), buf);
+    snprintf(buf, sizeof(buf), "%s", metrics.canActive ? "CAN: active" : "CAN: no data");
+    set_label_if_changed(status_label, lastStatus, sizeof(lastStatus), buf);
 
     refresh_clock_label();
 }
