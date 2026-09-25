@@ -43,8 +43,6 @@ static const unsigned long SD_LOG_FLUSH_INTERVAL_MS = 1000;
 static const int SD_SPI_SCK_PIN = 12;
 static const int SD_SPI_MISO_PIN = 13;
 static const int SD_SPI_MOSI_PIN = 11;
-static const int SD_CARD_CS = -1; // CS is controlled by the CH422G expander.
-static const uint8_t SD_EXPANDER_CS_PIN = 4;
 static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
 static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
 
@@ -159,7 +157,7 @@ static bool expander_init() {
         return false;
     }
 
-    uint8_t outputLevels = static_cast<uint8_t>(~(1U << SD_EXPANDER_CS_PIN));
+    uint8_t outputLevels = 0xFF;
     if (i2c_master_write_to_device(I2C_NUM_0, CH422G_IO_WRITE_ADDRESS, &outputLevels,
                                    sizeof(outputLevels), pdMS_TO_TICKS(10)) != ESP_OK) {
         Serial.println("EXPANDER: output level write failed");
@@ -207,26 +205,9 @@ static bool hardware_display_init() {
 }
 
 static bool sd_log_init() {
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CARD_CS);
-    if (!SD.begin(SD_CARD_CS)) {
-        Serial.println("SD: mount failed; CAN capture disabled");
-        return false;
-    }
-
-    canLogFile = SD.open(CAN_LOG_PATH, FILE_APPEND);
-    if (!canLogFile) {
-        Serial.println("SD: failed to open CAN capture file");
-        return false;
-    }
-
-    if (canLogFile.size() == 0) {
-        canLogFile.println("timestamp_ms,can_id,extended,dlc,data0,data1,data2,data3,data4,data5,data6,data7");
-    }
-    canLogFile.printf("# capture started at %lu ms\n", millis());
-    canLogFile.flush();
-    sdLoggingEnabled = true;
-    Serial.printf("SD: logging raw CAN frames to %s\n", CAN_LOG_PATH);
-    return true;
+    // The board's TF CS is GPIO10, which is also the LCD RGB data4 pin.
+    // Do not claim it while the display is active.
+    return false;
 }
 
 static void queue_can_log(const twai_message_t &message) {
