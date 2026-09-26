@@ -38,8 +38,12 @@ static constexpr bool CAN_ROUTE_ENABLED = BAFANG_CAN_ROUTE_ENABLED != 0;
 static const unsigned long BLE_NOTIFY_INTERVAL_MS = 500;
 static const unsigned long SD_LOG_FLUSH_INTERVAL_MS = 1000;
 
-static constexpr uint8_t PCF8563_I2C_ADDRESS = 0x51;
-static constexpr uint8_t PCF8563_SECONDS_REGISTER = 0x02;
+// Waveshare's own 04_RTC_Test example confirms this board's RTC chip is a PCF85063A
+// (register layout differs from the more common PCF8563 despite sharing address 0x51).
+static constexpr uint8_t PCF85063A_I2C_ADDRESS = 0x51;
+static constexpr uint8_t PCF85063A_CTRL1_REGISTER = 0x00;
+static constexpr uint8_t PCF85063A_SECONDS_REGISTER = 0x04;
+static constexpr int PCF85063A_YEAR_OFFSET = 1970;
 static const uint8_t USB_CAN_SELECT_PIN = 5;
 static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
 static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
@@ -184,6 +188,10 @@ static bool decode_bcd(uint8_t rawValue, int &decodedValue) {
     return true;
 }
 
+static uint8_t encode_bcd(int value) {
+    return static_cast<uint8_t>(((value / 10) << 4) | (value % 10));
+}
+
 static int64_t days_from_civil(int year, unsigned month, unsigned day) {
     year -= month <= 2;
     const int64_t era = (year >= 0 ? year : year - 399) / 400;
@@ -195,14 +203,15 @@ static int64_t days_from_civil(int year, unsigned month, unsigned day) {
 }
 
 static bool rtc_sync_system_time() {
-    Wire.beginTransmission(PCF8563_I2C_ADDRESS);
-    Wire.write(PCF8563_SECONDS_REGISTER);
+    Wire.beginTransmission(PCF85063A_I2C_ADDRESS);
+    Wire.write(PCF85063A_SECONDS_REGISTER);
     if (Wire.endTransmission(false) != 0 ||
-        Wire.requestFrom(PCF8563_I2C_ADDRESS, static_cast<uint8_t>(7)) != 7) {
-        Serial.println("RTC: PCF8563 read failed");
+        Wire.requestFrom(PCF85063A_I2C_ADDRESS, static_cast<uint8_t>(7)) != 7) {
+        Serial.println("RTC: PCF85063A read failed");
         return false;
     }
 
+    // Register order: seconds, minutes, hours, days, weekdays, months, years.
     uint8_t registers[7];
     for (uint8_t &value : registers) {
         value = Wire.read();
@@ -216,13 +225,13 @@ static bool rtc_sync_system_time() {
         !decode_bcd(registers[3] & 0x3F, day) ||
         !decode_bcd(registers[5] & 0x1F, month) ||
         !decode_bcd(registers[6], year)) {
-        Serial.println("RTC: invalid or unset PCF8563 time");
+        Serial.println("RTC: invalid or unset PCF85063A time");
         return false;
     }
 
-    year += (registers[5] & 0x80) != 0 ? 1900 : 2000;
+    year += PCF85063A_YEAR_OFFSET;
     if (second > 59 || minute > 59 || hour > 23 || month < 1 || month > 12 || day < 1) {
-        Serial.println("RTC: out-of-range PCF8563 time");
+        Serial.println("RTC: out-of-range PCF85063A time");
         return false;
     }
 
@@ -242,9 +251,38 @@ static bool rtc_sync_system_time() {
         Serial.println("RTC: settimeofday failed");
         return false;
     }
-    Serial.printf("RTC: system time synchronized from PCF8563 (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+    Serial.printf("RTC: system time synchronized from PCF85063A (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
                   year, month, day, hour, minute, second);
     return true;
+}
+
+// Registered with dashboard_layout via set_rtc_write_callback() so the on-screen clock
+// editor persists the chosen time to the battery-backed PCF85063A, surviving power cycles.
+static void rtc_write_time(int year, unsigned month, unsigned day, int hour, int minute) {
+    // CTRL_1 default (oscillator running, no stop/reset) - some boards boot with STOP set.
+    Wire.beginTransmission(PCF85063A_I2C_ADDRESS);
+    Wire.write(PCF85063A_CTRL1_REGISTER);
+    Wire.write(static_cast<uint8_t>(0x00));
+    Wire.endTransmission();
+
+    Wire.beginTransmission(PCF85063A_I2C_ADDRESS);
+    Wire.write(PCF85063A_SECONDS_REGISTER);
+    Wire.write(encode_bcd(0));               // seconds, also clears the oscillator-stop/invalid flag
+    Wire.write(encode_bcd(minute));
+    Wire.write(encode_bcd(hour));
+    Wire.write(encode_bcd(static_cast<int>(day)));
+    Wire.write(0x00);                         // weekday, unused
+    Wire.write(encode_bcd(static_cast<int>(month)));
+    Wire.write(encode_bcd(year - PCF85063A_YEAR_OFFSET));
+    if (Wire.endTransmission() != 0) {
+        Serial.println("RTC: PCF85063A write failed");
+        return;
+    }
+
+    int64_t epoch = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60;
+    timeval systemTime = {static_cast<time_t>(epoch), 0};
+    settimeofday(&systemTime, nullptr);
+    Serial.printf("RTC: PCF85063A set to %04d-%02d-%02u %02d:%02d:00 UTC\n", year, month, day, hour, minute);
 }
 
 static bool hardware_display_init() {
@@ -612,6 +650,7 @@ void setup() {
     if (!hardware_display_init()) {
         Serial.println("DISPLAY: initialization failed");
     } else {
+        set_rtc_write_callback(rtc_write_time);
         create_dashboard();
     }
 

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <lvgl.h>
 
 LV_FONT_DECLARE(lv_font_montserrat_24);
@@ -25,10 +26,15 @@ lv_obj_t *day_spinbox = nullptr;
 lv_obj_t *hour_spinbox = nullptr;
 lv_obj_t *minute_spinbox = nullptr;
 
-// Software clock: no RTC on this board, so time is kept as an epoch-seconds
-// base captured at a known LVGL tick, advanced by the tick delta since then.
+// Software clock: kept as an epoch-seconds base captured at a known LVGL tick,
+// advanced by the tick delta since then. Seeded from the system clock (which
+// main.cpp sets from the PCF8563 RTC at boot, if present) in create_dashboard().
 int64_t clock_epoch_base = 0;
 uint32_t clock_tick_base = 0;
+
+// Set via set_rtc_write_callback() so a real RTC chip can be persisted when the
+// user edits the time on-screen; stays null (no-op) on builds without an RTC.
+RtcWriteCallback rtc_write_callback = nullptr;
 
 // Days since 1970-01-01 for a civil (year, month, day) date, and the inverse.
 // http://howardhinnant.github.io/date_algorithms.html - avoids depending on
@@ -109,6 +115,10 @@ void apply_time_settings_cb(lv_event_t *) {
 
     clock_epoch_base = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60;
     clock_tick_base = lv_tick_get();
+
+    if (rtc_write_callback != nullptr) {
+        rtc_write_callback(y, mo, d, h, mi);
+    }
 
     refresh_clock_label();
     close_time_settings_overlay();
@@ -255,7 +265,19 @@ void set_label_if_changed(lv_obj_t *label, char *lastText, size_t lastTextSize, 
 }
 } // namespace
 
+void set_rtc_write_callback(RtcWriteCallback callback) {
+    rtc_write_callback = callback;
+}
+
 void create_dashboard() {
+    // Seed the software clock from the system clock, which main.cpp already
+    // synchronized from the RTC chip at boot (if one is present).
+    time_t now = time(nullptr);
+    if (now > 0) {
+        clock_epoch_base = static_cast<int64_t>(now);
+    }
+    clock_tick_base = lv_tick_get();
+
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), 0);
     lv_obj_set_style_text_color(screen, lv_color_hex(0xF4F7FA), 0);
