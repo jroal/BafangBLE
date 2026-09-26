@@ -7,6 +7,7 @@
 #include <lvgl.h>
 
 LV_FONT_DECLARE(lv_font_montserrat_24);
+LV_FONT_DECLARE(lv_font_montserrat_32);
 LV_FONT_DECLARE(lv_font_montserrat_48);
 
 namespace {
@@ -142,7 +143,7 @@ lv_obj_t *create_spin_field(lv_obj_t *parent, const char *title, int min, int ma
 
     lv_obj_t *title_label = lv_label_create(field);
     lv_label_set_text(title_label, title);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(title_label, lv_color_hex(0x65D6FF), 0);
 
     lv_obj_t *stepper = lv_obj_create(field);
@@ -150,26 +151,29 @@ lv_obj_t *create_spin_field(lv_obj_t *parent, const char *title, int min, int ma
     lv_obj_set_size(stepper, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(stepper, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(stepper, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(stepper, 6, 0);
+    lv_obj_set_style_pad_column(stepper, 8, 0);
     lv_obj_set_scrollable(stepper, false);
 
     lv_obj_t *minus_btn = lv_button_create(stepper);
-    lv_obj_set_size(minus_btn, 44, 44);
+    lv_obj_set_size(minus_btn, 60, 60);
     lv_obj_t *minus_label = lv_label_create(minus_btn);
     lv_label_set_text(minus_label, "-");
+    lv_obj_set_style_text_font(minus_label, &lv_font_montserrat_32, 0);
     lv_obj_center(minus_label);
 
     lv_obj_t *spinbox = lv_spinbox_create(stepper);
     lv_spinbox_set_range(spinbox, min, max);
     lv_spinbox_set_digit_format(spinbox, static_cast<uint32_t>(digits), 0);
     lv_spinbox_set_value(spinbox, value);
-    lv_obj_set_size(spinbox, digits > 2 ? 74 : 58, 44);
+    lv_obj_set_style_text_font(spinbox, &lv_font_montserrat_48, 0);
+    lv_obj_set_size(spinbox, digits > 2 ? 118 : 90, 64);
     lv_obj_set_clickable(spinbox, false);
 
     lv_obj_t *plus_btn = lv_button_create(stepper);
-    lv_obj_set_size(plus_btn, 44, 44);
+    lv_obj_set_size(plus_btn, 60, 60);
     lv_obj_t *plus_label = lv_label_create(plus_btn);
     lv_label_set_text(plus_label, "+");
+    lv_obj_set_style_text_font(plus_label, &lv_font_montserrat_32, 0);
     lv_obj_center(plus_label);
 
     lv_obj_add_event_cb(minus_btn, spin_decrement_cb, LV_EVENT_CLICKED, spinbox);
@@ -201,7 +205,7 @@ void open_time_settings_overlay(lv_event_t *) {
     lv_obj_set_clickable(time_settings_overlay, true);
 
     lv_obj_t *panel = lv_obj_create(time_settings_overlay);
-    lv_obj_set_size(panel, 700, 400);
+    lv_obj_set_size(panel, 770, 440);
     lv_obj_center(panel);
     lv_obj_set_style_bg_color(panel, lv_color_hex(0x1A2530), 0);
     lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
@@ -210,18 +214,18 @@ void open_time_settings_overlay(lv_event_t *) {
 
     lv_obj_t *title = lv_label_create(panel);
     lv_label_set_text(title, "Set date & time");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x65D6FF), 0);
 
     // Fixed width + wrap so the 5 fields never overflow the panel; they flow onto a
     // second row (e.g. Year/Month/Day, then Hour/Min) instead of getting clipped.
     lv_obj_t *fields_row = lv_obj_create(panel);
     lv_obj_remove_style_all(fields_row);
-    lv_obj_set_size(fields_row, 640, LV_SIZE_CONTENT);
+    lv_obj_set_size(fields_row, 720, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(fields_row, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(fields_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(fields_row, 45, 0);
-    lv_obj_set_style_pad_row(fields_row, 25, 0);
+    lv_obj_set_style_pad_column(fields_row, 40, 0);
+    lv_obj_set_style_pad_row(fields_row, 30, 0);
     lv_obj_set_scrollable(fields_row, false);
 
     year_spinbox = create_spin_field(fields_row, "Year", 2000, 2099, 4, cur_year);
@@ -230,25 +234,28 @@ void open_time_settings_overlay(lv_event_t *) {
     hour_spinbox = create_spin_field(fields_row, "Hour", 0, 23, 2, cur_hour);
     minute_spinbox = create_spin_field(fields_row, "Min", 0, 59, 2, cur_minute);
 
+    // Full panel width + space-between so Cancel lands at the bottom-left corner
+    // and Set lands at the bottom-right corner.
     lv_obj_t *buttons_row = lv_obj_create(panel);
     lv_obj_remove_style_all(buttons_row);
-    lv_obj_set_size(buttons_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(buttons_row, 720, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(buttons_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(buttons_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(buttons_row, 24, 0);
+    lv_obj_set_flex_align(buttons_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_scrollable(buttons_row, false);
 
     lv_obj_t *cancel_btn = lv_button_create(buttons_row);
-    lv_obj_set_size(cancel_btn, 130, 48);
+    lv_obj_set_size(cancel_btn, 150, 56);
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_24, 0);
     lv_obj_center(cancel_label);
     lv_obj_add_event_cb(cancel_btn, cancel_time_settings_cb, LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t *set_btn = lv_button_create(buttons_row);
-    lv_obj_set_size(set_btn, 130, 48);
+    lv_obj_set_size(set_btn, 150, 56);
     lv_obj_t *set_label = lv_label_create(set_btn);
     lv_label_set_text(set_label, "Set");
+    lv_obj_set_style_text_font(set_label, &lv_font_montserrat_24, 0);
     lv_obj_center(set_label);
     lv_obj_add_event_cb(set_btn, apply_time_settings_cb, LV_EVENT_CLICKED, nullptr);
 }
