@@ -24,17 +24,15 @@
 // =========================================================================
 // CONFIGURATION - verify against your wiring / captured bus traffic
 // =========================================================================
-// TODO: confirm these against the actual CAN transceiver wiring on your board.
-static const gpio_num_t CAN_TX_PIN = GPIO_NUM_4;
-static const gpio_num_t CAN_RX_PIN = GPIO_NUM_6;
-static const uint32_t CAN_BITRATE = 500000; // TODO: verify actual M620 CAN bitrate (500 kbps assumed)
-
-// TODO: these CAN identifiers and byte layouts are placeholders. Bafang has not
-// published the M620 CAN protocol; capture real traffic (e.g. with a CAN sniffer)
-// and replace the IDs/scaling below with verified values before relying on this data.
-static const uint32_t CAN_ID_MOTOR_STATUS = 0x300; // speed, cadence, assist level, error code
-static const uint32_t CAN_ID_MOTOR_POWER = 0x301;  // power, torque, motor temp
-static const uint32_t CAN_ID_BATTERY_STATUS = 0x310; // voltage, current, state of charge
+// Onboard TJA1051 transceiver on the Waveshare ESP32-S3-Touch-LCD-4.3B is hardwired to these pins.
+static const gpio_num_t CAN_TX_PIN = GPIO_NUM_15;
+static const gpio_num_t CAN_RX_PIN = GPIO_NUM_20;
+// Match the confirmed low 16 bits; the complete 29-bit identifier was not provided.
+static const uint32_t CAN_TELEMETRY_ID_SUFFIX = 0x3200;
+#ifndef BAFANG_CAN_ROUTE_ENABLED
+#define BAFANG_CAN_ROUTE_ENABLED 1
+#endif
+static constexpr bool CAN_ROUTE_ENABLED = BAFANG_CAN_ROUTE_ENABLED != 0;
 
 static const unsigned long BLE_NOTIFY_INTERVAL_MS = 500;
 static const unsigned long SD_LOG_FLUSH_INTERVAL_MS = 1000;
@@ -43,10 +41,17 @@ static const unsigned long SD_LOG_FLUSH_INTERVAL_MS = 1000;
 static const int SD_SPI_SCK_PIN = 12;
 static const int SD_SPI_MISO_PIN = 13;
 static const int SD_SPI_MOSI_PIN = 11;
-static const int SD_CARD_CS = -1;
+static const uint32_t SD_SPI_CLOCK_HZ = 20000000;
+// The card's actual CS is CH422G EXIO4; this unused GPIO satisfies SD.begin()
+// because Arduino-ESP32 2.x unconditionally configures its CS argument as a GPIO.
+static const int SD_SPI_DUMMY_CS_PIN = 6;
 static const uint8_t SD_EXPANDER_CS_PIN = 4;
+static const uint8_t USB_CAN_SELECT_PIN = 5;
 static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
 static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
+static constexpr UBaseType_t CAN_LOG_QUEUE_LENGTH = 1024;
+static constexpr unsigned long SD_LOG_RETRY_INTERVAL_MS = 5000;
+volatile bool canRouteActive = false;
 
 #define BLE_SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TELEMETRY_CHAR_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -83,7 +88,8 @@ struct CanLogRecord {
 
 QueueHandle_t canLogQueue = NULL;
 File canLogFile;
-bool sdLoggingEnabled = false;
+volatile bool sdLoggingEnabled = false;
+volatile uint32_t canLogDroppedFrames = 0;
 
 // =========================================================================
 // DISPLAY / LVGL
@@ -103,6 +109,16 @@ volatile bool touchPressedShared = false;
 volatile uint16_t touchXShared = 0;
 volatile uint16_t touchYShared = 0;
 TaskHandle_t TouchTaskHandle = NULL;
+
+static bool expander_write_io(uint8_t outputLevels) {
+    uint8_t outputEnable = 0x01;
+    if (i2c_master_write_to_device(I2C_NUM_0, 0x24, &outputEnable,
+                                   sizeof(outputEnable), pdMS_TO_TICKS(10)) != ESP_OK) {
+        return false;
+    }
+    return i2c_master_write_to_device(I2C_NUM_0, CH422G_IO_WRITE_ADDRESS, &outputLevels,
+                                      sizeof(outputLevels), pdMS_TO_TICKS(10)) == ESP_OK;
+}
 
 static void hardware_flush_cb(lv_display_t *display, const lv_area_t *area, uint8_t *pixelMap) {
     if (hardwareLcd != nullptr) {
@@ -159,9 +175,9 @@ static bool expander_init() {
         return false;
     }
 
-    uint8_t outputLevels = 0xFF;
-    if (i2c_master_write_to_device(I2C_NUM_0, CH422G_IO_WRITE_ADDRESS, &outputLevels,
-                                   sizeof(outputLevels), pdMS_TO_TICKS(10)) != ESP_OK) {
+    // Keep native USB connected until the CAN task selects the CAN route.
+    uint8_t outputLevels = static_cast<uint8_t>(0xFFU & ~(1U << USB_CAN_SELECT_PIN));
+    if (!expander_write_io(outputLevels)) {
         Serial.println("EXPANDER: output level write failed");
         return false;
     }
@@ -208,22 +224,26 @@ static bool hardware_display_init() {
 
 static bool sd_log_init() {
     uint8_t outputLevels = static_cast<uint8_t>(0xFFU & ~(1U << SD_EXPANDER_CS_PIN));
-    if (i2c_master_write_to_device(I2C_NUM_0, CH422G_IO_WRITE_ADDRESS, &outputLevels,
-                                   sizeof(outputLevels), pdMS_TO_TICKS(10)) != ESP_OK) {
+    if (!CAN_ROUTE_ENABLED || !canRouteActive) {
+        outputLevels = static_cast<uint8_t>(outputLevels & ~(1U << USB_CAN_SELECT_PIN));
+    }
+    if (!expander_write_io(outputLevels)) {
         Serial.println("SD: failed to select TF card through CH422G");
         return false;
     }
 
     SPI.setHwCs(false);
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_CARD_CS);
-    if (!SD.begin(SD_CARD_CS, SPI, 80000000)) {
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, -1);
+    if (!SD.begin(SD_SPI_DUMMY_CS_PIN, SPI, SD_SPI_CLOCK_HZ)) {
         Serial.println("SD: mount failed; CAN capture disabled");
+        SD.end();
         return false;
     }
 
     canLogFile = SD.open(CAN_LOG_PATH, FILE_APPEND);
     if (!canLogFile) {
         Serial.println("SD: failed to open CAN capture file");
+        SD.end();
         return false;
     }
 
@@ -238,40 +258,74 @@ static bool sd_log_init() {
 }
 
 static void queue_can_log(const twai_message_t &message) {
-    if (!sdLoggingEnabled) {
+    if (!sdLoggingEnabled || canLogQueue == NULL) {
+        ++canLogDroppedFrames;
         return;
     }
 
     CanLogRecord record = {millis(), message};
-    xQueueSend(canLogQueue, &record, 0);
+    if (xQueueSend(canLogQueue, &record, 0) != pdTRUE) {
+        ++canLogDroppedFrames;
+    }
 }
 
 static void SDLoggerLoop(void *) {
-    canLogQueue = xQueueCreate(256, sizeof(CanLogRecord));
-    if (canLogQueue == NULL || !sd_log_init()) {
+    canLogQueue = xQueueCreate(CAN_LOG_QUEUE_LENGTH, sizeof(CanLogRecord));
+    if (canLogQueue == NULL) {
+        Serial.println("SD: failed to create CAN capture queue");
         vTaskDelete(NULL);
         return;
     }
 
-    unsigned long lastFlush = millis();
+    unsigned long now = millis();
+    unsigned long lastFlush = now;
+    unsigned long lastMountAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
+    unsigned long lastStatus = now;
     CanLogRecord record;
 
     while (true) {
-        if (xQueueReceive(canLogQueue, &record, pdMS_TO_TICKS(100)) == pdTRUE) {
-            const twai_message_t &message = record.message;
-            canLogFile.printf(
-                "%lu,0x%03lX,%u,%u,%02X,%02X,%02X,%02X,%02X,%02X,%02X,%02X\n",
-                record.timestampMs,
-                static_cast<unsigned long>(message.identifier),
-                message.extd ? 1 : 0,
-                message.data_length_code,
-                message.data[0], message.data[1], message.data[2], message.data[3],
-                message.data[4], message.data[5], message.data[6], message.data[7]);
+        now = millis();
+        if (!sdLoggingEnabled && now - lastMountAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
+            lastMountAttempt = now;
+            if (sd_log_init()) {
+                lastFlush = now;
+            }
         }
 
-        if (millis() - lastFlush >= SD_LOG_FLUSH_INTERVAL_MS) {
-            canLogFile.flush();
-            lastFlush = millis();
+        if (sdLoggingEnabled) {
+            if (xQueueReceive(canLogQueue, &record, pdMS_TO_TICKS(100)) == pdTRUE) {
+                const twai_message_t &message = record.message;
+                canLogFile.printf("%lu,0x%08lX,%u,%u",
+                                  record.timestampMs,
+                                  static_cast<unsigned long>(message.identifier),
+                                  message.extd ? 1 : 0,
+                                  message.data_length_code);
+                for (uint8_t dataIndex = 0; dataIndex < 8; ++dataIndex) {
+                    if (!message.rtr && dataIndex < message.data_length_code) {
+                        canLogFile.printf(",%02X", message.data[dataIndex]);
+                    } else {
+                        canLogFile.print(',');
+                    }
+                }
+                canLogFile.println();
+            }
+
+            now = millis();
+            if (now - lastFlush >= SD_LOG_FLUSH_INTERVAL_MS) {
+                canLogFile.flush();
+                lastFlush = now;
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        now = millis();
+        if (now - lastStatus >= 5000) {
+            Serial.printf("SD: %s; queued=%u; dropped_frames=%lu\n",
+                          sdLoggingEnabled ? "capture active" : "capture unavailable",
+                          static_cast<unsigned>(uxQueueMessagesWaiting(canLogQueue)),
+                          static_cast<unsigned long>(canLogDroppedFrames));
+            lastStatus = now;
         }
     }
 }
@@ -336,8 +390,10 @@ static void ble_notify_telemetry() {
 // =========================================================================
 static bool can_init() {
     twai_general_config_t generalConfig =
-        TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-    twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_500KBITS();
+        // LISTEN_ONLY: TX is fully disabled at the hardware level - no ACKs, no error
+        // frames, no bus-off recovery attempts. Safe to tap into the bike's live CAN bus.
+        TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_LISTEN_ONLY);
+    twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_250KBITS();
     twai_filter_config_t filterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&generalConfig, &timingConfig, &filterConfig) != ESP_OK) {
@@ -351,27 +407,37 @@ static bool can_init() {
     return true;
 }
 
-// TODO: byte offsets/scaling below are placeholders pending verified M620 CAN spec.
-static void decode_motor_status(const twai_message_t &msg) {
-    liveData.speedKmh = msg.data[0] / 10.0f;   // assumed 0.1 km/h units
-    liveData.cadenceRpm = msg.data[1];
-    liveData.assistLevel = msg.data[2] & 0x0F;
-    liveData.errorCode = msg.data[3];
-}
-
-static void decode_motor_power(const twai_message_t &msg) {
-    liveData.powerWatts = (uint16_t)(msg.data[0] << 8 | msg.data[1]);
-    liveData.motorTempC = (int8_t)msg.data[2] - 40; // assumed offset like automotive CAN temp encoding
-}
-
-static void decode_battery_status(const twai_message_t &msg) {
-    liveData.batteryVoltage = ((msg.data[0] << 8) | msg.data[1]) / 100.0f; // assumed 0.01V units
-    int16_t currentRaw = (int16_t)((msg.data[2] << 8) | msg.data[3]);
-    liveData.batteryCurrent = currentRaw / 100.0f; // assumed 0.01A units
-    liveData.batterySocPercent = msg.data[4];
+static void decode_motor_telemetry(const twai_message_t &msg) {
+    liveData.powerWatts = static_cast<uint16_t>(msg.data[0]) |
+                          (static_cast<uint16_t>(msg.data[1]) << 8);
+    liveData.cadenceRpm = static_cast<uint16_t>(msg.data[2]) |
+                          (static_cast<uint16_t>(msg.data[3]) << 8);
 }
 
 void CANProcessingLoop(void *pvParameters) {
+    if (!CAN_ROUTE_ENABLED) {
+        Serial.println("CAN: disabled in SD/USB bench mode");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t outputLevels = static_cast<uint8_t>(
+        (0xFFU & ~(1U << SD_EXPANDER_CS_PIN)) | (1U << USB_CAN_SELECT_PIN));
+    if (!expander_write_io(outputLevels)) {
+        Serial.println("CAN: failed to select CAN route through USB mux");
+        vTaskDelete(NULL);
+        return;
+    }
+    canRouteActive = true;
+
+    // Driver install runs here, not in setup(), so a hang/failure can never block
+    // display bring-up (same lesson as the SD boot fix - see sd_log_init()).
+    if (!can_init()) {
+        Serial.println("CAN: initialization failed, motor data will be unavailable");
+        vTaskDelete(NULL);
+        return;
+    }
+
     unsigned long lastValidFrame = 0;
 
     while (true) {
@@ -382,18 +448,9 @@ void CANProcessingLoop(void *pvParameters) {
             lastValidFrame = millis();
             liveData.canActive = true;
 
-            switch (rx_msg.identifier) {
-                case CAN_ID_MOTOR_STATUS:
-                    decode_motor_status(rx_msg);
-                    break;
-                case CAN_ID_MOTOR_POWER:
-                    decode_motor_power(rx_msg);
-                    break;
-                case CAN_ID_BATTERY_STATUS:
-                    decode_battery_status(rx_msg);
-                    break;
-                default:
-                    break;
+            if (rx_msg.extd && !rx_msg.rtr && rx_msg.data_length_code >= 4 &&
+                (rx_msg.identifier & 0xFFFFU) == CAN_TELEMETRY_ID_SUFFIX) {
+                decode_motor_telemetry(rx_msg);
             }
             xSemaphoreGive(dataMutex);
         }
@@ -449,23 +506,22 @@ void setup() {
         Serial.println("EXPANDER: initialization failed, touch/backlight/SD may misbehave");
     }
 
-    if (!can_init()) {
-        Serial.println("CAN: initialization failed, motor data will be unavailable");
-    }
-    ble_init();
-
     if (!hardware_display_init()) {
         Serial.println("DISPLAY: initialization failed");
     } else {
         create_dashboard();
     }
 
-    xTaskCreatePinnedToCore(CANProcessingLoop, "CANTask", 4096, NULL, 1, &CANTaskHandle, 0);
+    // Display/UI tasks are created before CAN/BLE init below, so a hang or failure
+    // in either can no longer prevent the screen from ever coming up.
     xTaskCreatePinnedToCore(TouchProcessingLoop, "TouchTask", 3072, NULL, 1, &TouchTaskHandle, 0);
     xTaskCreatePinnedToCore(UIProcessingLoop, "UITask", 8192, NULL, 1, &UITaskHandle, 1);
-    // Runs its own SD.begin() - kept off the boot path since a slow/stuck card must not
-    // delay UITask startup (previously froze the whole boot with no display ever drawn).
-    xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 1, &SDLoggerTaskHandle, 1);
+    // Runs its own can_init()/SD.begin() - kept off the boot path since a slow/stuck
+    // peripheral must not delay UITask startup (previously froze boot with a blank screen).
+    xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 0, &SDLoggerTaskHandle, 1);
+    xTaskCreatePinnedToCore(CANProcessingLoop, "CANTask", 4096, NULL, 1, &CANTaskHandle, 0);
+
+    ble_init(); // ble_notify_telemetry() is null-safe, so deferring this is safe
 }
 
 void loop() {
