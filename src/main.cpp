@@ -47,7 +47,9 @@ static constexpr int PCF85063A_YEAR_OFFSET = 1970;
 static const uint8_t USB_CAN_SELECT_PIN = 5;
 static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
 static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
+static constexpr const char *ERROR_LOG_PATH = "/error.log";
 static constexpr UBaseType_t CAN_LOG_QUEUE_LENGTH = 1024;
+static constexpr UBaseType_t ERROR_LOG_QUEUE_LENGTH = 32;
 static constexpr unsigned long SD_LOG_RETRY_INTERVAL_MS = 5000;
 
 #define BLE_SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -83,11 +85,34 @@ struct CanLogRecord {
     twai_message_t message;
 };
 
+struct ErrorLogRecord {
+    uint32_t timestampMs;
+    char message[128];
+};
+
 QueueHandle_t canLogQueue = NULL;
+QueueHandle_t errorLogQueue = NULL;
 File canLogFile;
+File errorLogFile;
+volatile bool sdCardMounted = false;
 volatile bool sdLoggingEnabled = false;
 volatile uint32_t canLogDroppedFrames = 0;
+volatile uint32_t errorLogDroppedMessages = 0;
 bool canDriverStarted = false;
+
+static void log_error(const char *message) {
+    if (errorLogQueue == NULL) {
+        Serial.printf("ERROR (SD queue unavailable): %s\n", message);
+        return;
+    }
+
+    ErrorLogRecord record = {};
+    record.timestampMs = millis();
+    snprintf(record.message, sizeof(record.message), "%s", message);
+    if (xQueueSend(errorLogQueue, &record, 0) != pdTRUE) {
+        ++errorLogDroppedMessages;
+    }
+}
 
 // =========================================================================
 // DISPLAY / LVGL
@@ -172,7 +197,7 @@ void TouchProcessingLoop(void *) {
 static bool expander_init() {
     uint8_t outputLevels = expander_usb_can_levels();
     if (!expander_write_io(outputLevels)) {
-        Serial.println("EXPANDER: output level write failed");
+        log_error("EXPANDER: output level write failed");
         return false;
     }
     return true;
@@ -207,7 +232,7 @@ static bool rtc_sync_system_time() {
     Wire.write(PCF85063A_SECONDS_REGISTER);
     if (Wire.endTransmission(false) != 0 ||
         Wire.requestFrom(PCF85063A_I2C_ADDRESS, static_cast<uint8_t>(7)) != 7) {
-        Serial.println("RTC: PCF85063A read failed");
+        log_error("RTC: PCF85063A read failed");
         return false;
     }
 
@@ -225,13 +250,13 @@ static bool rtc_sync_system_time() {
         !decode_bcd(registers[3] & 0x3F, day) ||
         !decode_bcd(registers[5] & 0x1F, month) ||
         !decode_bcd(registers[6], year)) {
-        Serial.println("RTC: invalid or unset PCF85063A time");
+        log_error("RTC: invalid or unset PCF85063A time");
         return false;
     }
 
     year += PCF85063A_YEAR_OFFSET;
     if (second > 59 || minute > 59 || hour > 23 || month < 1 || month > 12 || day < 1) {
-        Serial.println("RTC: out-of-range PCF85063A time");
+        log_error("RTC: out-of-range PCF85063A time");
         return false;
     }
 
@@ -241,14 +266,14 @@ static bool rtc_sync_system_time() {
         ++monthLength;
     }
     if (day > monthLength) {
-        Serial.println("RTC: invalid PCF8563 calendar date");
+        log_error("RTC: invalid PCF85063A calendar date");
         return false;
     }
 
     int64_t epoch = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
     timeval systemTime = {static_cast<time_t>(epoch), 0};
     if (settimeofday(&systemTime, nullptr) != 0) {
-        Serial.println("RTC: settimeofday failed");
+        log_error("RTC: settimeofday failed");
         return false;
     }
     Serial.printf("RTC: system time synchronized from PCF85063A (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
@@ -275,7 +300,7 @@ static void rtc_write_time(int year, unsigned month, unsigned day, int hour, int
     Wire.write(encode_bcd(static_cast<int>(month)));
     Wire.write(encode_bcd(year - PCF85063A_YEAR_OFFSET));
     if (Wire.endTransmission() != 0) {
-        Serial.println("RTC: PCF85063A write failed");
+        log_error("RTC: PCF85063A write failed");
         return;
     }
 
@@ -292,11 +317,11 @@ static bool hardware_display_init() {
     hardwarePanel.begin();
     uint8_t outputLevels = expander_usb_can_levels();
     if (!expander_write_io(outputLevels)) {
-        Serial.println("EXPANDER: failed to restore USB routing after panel initialization");
+        log_error("EXPANDER: failed to restore USB routing after panel initialization");
     }
     hardwareLcd = hardwarePanel.getLcd();
     if (hardwareLcd == nullptr) {
-        Serial.println("DISPLAY: LCD initialization failed");
+        log_error("DISPLAY: LCD initialization failed");
         return false;
     }
 
@@ -308,7 +333,7 @@ static bool hardware_display_init() {
     lvglFrameBuffer2 = static_cast<uint8_t *>(
         heap_caps_malloc(800 * BUFFER_LINES * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (lvglFrameBuffer == nullptr || lvglFrameBuffer2 == nullptr) {
-        Serial.println("DISPLAY: frame buffer allocation failed");
+        log_error("DISPLAY: frame buffer allocation failed");
         return false;
     }
     lv_display_set_buffers(hardwareDisplay, lvglFrameBuffer, lvglFrameBuffer2,
@@ -318,7 +343,7 @@ static bool hardware_display_init() {
 
     hardwareTouch = hardwarePanel.getLcdTouch();
     if (hardwareTouch == nullptr) {
-        Serial.println("DISPLAY: touch initialization failed, screen will be view-only");
+        log_error("DISPLAY: touch initialization failed, screen will be view-only");
     } else {
         hardwareTouchIndev = lv_indev_create();
         lv_indev_set_type(hardwareTouchIndev, LV_INDEV_TYPE_POINTER);
@@ -330,22 +355,28 @@ static bool hardware_display_init() {
 static bool sd_log_init() {
     uint8_t outputLevels = expander_usb_can_levels();
     if (!expander_write_io(outputLevels)) {
-        Serial.println("SD: failed to preserve selected USB/CAN route through CH422G");
+        log_error("SD: failed to preserve selected USB/CAN route through CH422G");
         return false;
     }
 
     if (!SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0) ||
         !SD_MMC.begin("/sdcard", true, false)) {
-        Serial.println("SD: mount failed; CAN capture disabled");
+        log_error("SD: mount failed; error and CAN logging unavailable");
         SD_MMC.end();
         return false;
     }
 
+    sdCardMounted = true;
+    errorLogFile = SD_MMC.open(ERROR_LOG_PATH, FILE_APPEND);
+    if (!errorLogFile) {
+        log_error("SD: failed to open error.log; queued errors retained for retry");
+    }
+
     canLogFile = SD_MMC.open(CAN_LOG_PATH, FILE_APPEND);
     if (!canLogFile) {
-        Serial.println("SD: failed to open CAN capture file");
-        SD_MMC.end();
-        return false;
+        log_error("SD: failed to open CAN capture file");
+        sdLoggingEnabled = false;
+        return true;
     }
 
     if (canLogFile.size() == 0) {
@@ -356,6 +387,14 @@ static bool sd_log_init() {
     sdLoggingEnabled = true;
     Serial.printf("SD: logging raw CAN frames to %s\n", CAN_LOG_PATH);
     return true;
+}
+
+static bool open_error_log() {
+    if (errorLogFile) {
+        return true;
+    }
+    errorLogFile = SD_MMC.open(ERROR_LOG_PATH, FILE_APPEND);
+    return static_cast<bool>(errorLogFile);
 }
 
 static void queue_can_log(const twai_message_t &message) {
@@ -371,28 +410,48 @@ static void queue_can_log(const twai_message_t &message) {
 }
 
 static void SDLoggerLoop(void *) {
-    if (canLogQueue == NULL) {
-        Serial.println("SD: failed to create CAN capture queue");
+    if (errorLogQueue == NULL) {
+        Serial.println("SD: failed to create error log queue");
         vTaskDelete(NULL);
         return;
+    }
+    if (canLogQueue == NULL) {
+        log_error("SD: failed to create CAN capture queue");
     }
 
     unsigned long now = millis();
     unsigned long lastFlush = now;
     unsigned long lastMountAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
+    unsigned long lastErrorOpenAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
     unsigned long lastStatus = now;
     CanLogRecord record;
+    ErrorLogRecord errorRecord;
 
     while (true) {
         now = millis();
-        if (!sdLoggingEnabled && now - lastMountAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
+        if (!sdCardMounted && now - lastMountAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
             lastMountAttempt = now;
             if (sd_log_init()) {
                 lastFlush = now;
             }
         }
 
-        if (sdLoggingEnabled) {
+        if (sdCardMounted) {
+            if (!errorLogFile && now - lastErrorOpenAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
+                lastErrorOpenAttempt = now;
+                open_error_log();
+            }
+
+            if (errorLogFile && xQueueReceive(errorLogQueue, &errorRecord, 0) == pdTRUE) {
+                errorLogFile.printf("%lu ms: %s\n",
+                                    static_cast<unsigned long>(errorRecord.timestampMs),
+                                    errorRecord.message);
+                errorLogFile.flush();
+            }
+
+        }
+
+        if (sdLoggingEnabled && canLogQueue != NULL) {
             if (xQueueReceive(canLogQueue, &record, pdMS_TO_TICKS(100)) == pdTRUE) {
                 const twai_message_t &message = record.message;
                 canLogFile.printf("%lu,0x%08lX,%u,%u",
@@ -423,7 +482,9 @@ static void SDLoggerLoop(void *) {
         if (now - lastStatus >= 5000) {
             Serial.printf("SD: %s; queued=%u; dropped_frames=%lu\n",
                           sdLoggingEnabled ? "capture active" : "capture unavailable",
-                          static_cast<unsigned>(uxQueueMessagesWaiting(canLogQueue)),
+                          canLogQueue != NULL
+                              ? static_cast<unsigned>(uxQueueMessagesWaiting(canLogQueue))
+                              : 0U,
                           static_cast<unsigned long>(canLogDroppedFrames));
             lastStatus = now;
         }
@@ -497,11 +558,11 @@ static bool can_init() {
     twai_filter_config_t filterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     if (twai_driver_install(&generalConfig, &timingConfig, &filterConfig) != ESP_OK) {
-        Serial.println("CAN: driver install failed");
+        log_error("CAN: driver install failed");
         return false;
     }
     if (twai_start() != ESP_OK) {
-        Serial.println("CAN: start failed");
+        log_error("CAN: start failed");
         return false;
     }
     return true;
@@ -516,7 +577,7 @@ static void decode_motor_telemetry(const twai_message_t &msg) {
 
 void CANProcessingLoop(void *pvParameters) {
     if (!CAN_ROUTE_ENABLED || !canDriverStarted) {
-        Serial.println("CAN: processing task stopped because TWAI is not initialized");
+        log_error("CAN: processing task stopped because TWAI is not initialized");
         vTaskDelete(NULL);
         return;
     }
@@ -604,7 +665,10 @@ void UIProcessingLoop(void *pvParameters) {
 void setup() {
     Serial.begin(115200);
 
-     delay(2000);
+     delay(1000);
+
+    errorLogQueue = xQueueCreate(ERROR_LOG_QUEUE_LENGTH, sizeof(ErrorLogRecord));
+    canLogQueue = xQueueCreate(CAN_LOG_QUEUE_LENGTH, sizeof(CanLogRecord));
 
     // LISTEN_ONLY mode keeps TX high/recessive so it cannot bring down the bus
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
@@ -619,21 +683,20 @@ void setup() {
         twai_start() == ESP_OK) {
         Serial.println("TWAI Driver running in LISTEN_ONLY mode.");
     } else {
-        Serial.println("TWAI Initialization Failed!");
+        log_error("TWAI initialization failed");
     }
 
     dataMutex = xSemaphoreCreateMutex();
     touchMutex = xSemaphoreCreateMutex();
-    canLogQueue = xQueueCreate(CAN_LOG_QUEUE_LENGTH, sizeof(CanLogRecord));
 
     if (!Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL)) {
-        Serial.println("I2C: Wire.begin failed");
+        log_error("I2C: Wire.begin failed");
     } else {
         Wire.setClock(400000);
     }
 
     if (!expander_init()) {
-        Serial.println("EXPANDER: initialization failed, USB routing or panel controls may misbehave");
+        log_error("EXPANDER: initialization failed, USB routing or panel controls may misbehave");
     }
 
     rtc_sync_system_time();
@@ -641,14 +704,14 @@ void setup() {
     if (CAN_ROUTE_ENABLED) {
         canDriverStarted = can_init();
         if (!canDriverStarted) {
-            Serial.println("CAN: initialization failed; motor data will be unavailable");
+            log_error("CAN: initialization failed; motor data will be unavailable");
         } else {
             xTaskCreatePinnedToCore(CANProcessingLoop, "CANTask", 4096, NULL, 1, &CANTaskHandle, 0);
         }
     }
 
     if (!hardware_display_init()) {
-        Serial.println("DISPLAY: initialization failed");
+        log_error("DISPLAY: initialization failed");
     } else {
         set_rtc_write_callback(rtc_write_time);
         create_dashboard();
