@@ -1,7 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <driver/twai.h>    // ESP32 native CAN driver (Bafang M620 uses CAN)
-#include <SD_MMC.h>
+#include <SD.h>
+#include <SPI.h>
 #include <ESP_Panel_Library.h>
 #include <esp_heap_caps.h>
 #include <sys/time.h>
@@ -47,7 +48,7 @@ static constexpr int PCF85063A_YEAR_OFFSET = 1970;
 static const uint8_t USB_CAN_SELECT_PIN = 5;
 static const uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
 static constexpr const char *CAN_LOG_PATH = "/can_capture.csv";
-static constexpr const char *ERROR_LOG_PATH = "/error.log";
+static constexpr const char *ERROR_LOG_PATH = "/error.txt";
 static constexpr UBaseType_t CAN_LOG_QUEUE_LENGTH = 1024;
 static constexpr UBaseType_t ERROR_LOG_QUEUE_LENGTH = 32;
 static constexpr unsigned long SD_LOG_RETRY_INTERVAL_MS = 5000;
@@ -81,11 +82,13 @@ TaskHandle_t UITaskHandle = NULL;
 TaskHandle_t SDLoggerTaskHandle = NULL;
 
 struct CanLogRecord {
+    time_t timestamp;
     uint32_t timestampMs;
     twai_message_t message;
 };
 
 struct ErrorLogRecord {
+    time_t timestamp;
     uint32_t timestampMs;
     char message[128];
 };
@@ -99,6 +102,7 @@ volatile bool sdLoggingEnabled = false;
 volatile uint32_t canLogDroppedFrames = 0;
 volatile uint32_t errorLogDroppedMessages = 0;
 bool canDriverStarted = false;
+bool sdSpiStarted = false;
 
 static void log_error(const char *message) {
     if (errorLogQueue == NULL) {
@@ -107,11 +111,21 @@ static void log_error(const char *message) {
     }
 
     ErrorLogRecord record = {};
+    record.timestamp = time(nullptr);
     record.timestampMs = millis();
     snprintf(record.message, sizeof(record.message), "%s", message);
     if (xQueueSend(errorLogQueue, &record, 0) != pdTRUE) {
         ++errorLogDroppedMessages;
     }
+}
+
+static void format_log_timestamp(time_t timestamp, uint32_t uptimeMs, char *buffer, size_t bufferSize) {
+    struct tm utcTime;
+    if (timestamp > 0 && gmtime_r(&timestamp, &utcTime) != nullptr &&
+        strftime(buffer, bufferSize, "%Y-%m-%d %H:%M:%S UTC", &utcTime) > 0) {
+        return;
+    }
+    snprintf(buffer, bufferSize, "uptime %lu ms", static_cast<unsigned long>(uptimeMs));
 }
 
 // =========================================================================
@@ -353,39 +367,35 @@ static bool hardware_display_init() {
 }
 
 static bool sd_log_init() {
-    uint8_t outputLevels = expander_usb_can_levels();
+    uint8_t outputLevels = static_cast<uint8_t>(expander_usb_can_levels() & ~(1U << PIN_SD_CS_EXPANDER));
     if (!expander_write_io(outputLevels)) {
         log_error("SD: failed to preserve selected USB/CAN route through CH422G");
         return false;
     }
 
-    if (!SD_MMC.setPins(PIN_SD_CLK, PIN_SD_CMD, PIN_SD_D0) ||
-        !SD_MMC.begin("/sdcard", true, false)) {
+    if (!sdSpiStarted) {
+        SPI.setHwCs(false);
+        SPI.begin(PIN_SD_CLK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_DUMMY_CS);
+        sdSpiStarted = true;
+    }
+
+    if (!SD.begin(PIN_SD_DUMMY_CS, SPI, 20000000, "/sdcard", 5, false)) {
         log_error("SD: mount failed; error and CAN logging unavailable");
-        SD_MMC.end();
+        SD.end();
         return false;
     }
 
     sdCardMounted = true;
-    errorLogFile = SD_MMC.open(ERROR_LOG_PATH, FILE_APPEND);
+    errorLogFile = SD.open(ERROR_LOG_PATH, FILE_APPEND);
     if (!errorLogFile) {
         log_error("SD: failed to open error.log; queued errors retained for retry");
+    } else {
+        char timestamp[32];
+        format_log_timestamp(time(nullptr), millis(), timestamp, sizeof(timestamp));
+        errorLogFile.printf("[%s] SD error log started\n", timestamp);
+        errorLogFile.flush();
     }
 
-    canLogFile = SD_MMC.open(CAN_LOG_PATH, FILE_APPEND);
-    if (!canLogFile) {
-        log_error("SD: failed to open CAN capture file");
-        sdLoggingEnabled = false;
-        return true;
-    }
-
-    if (canLogFile.size() == 0) {
-        canLogFile.println("timestamp_ms,can_id,extended,dlc,data0,data1,data2,data3,data4,data5,data6,data7");
-    }
-    canLogFile.printf("# capture started at %lu ms\n", millis());
-    canLogFile.flush();
-    sdLoggingEnabled = true;
-    Serial.printf("SD: logging raw CAN frames to %s\n", CAN_LOG_PATH);
     return true;
 }
 
@@ -393,20 +403,37 @@ static bool open_error_log() {
     if (errorLogFile) {
         return true;
     }
-    errorLogFile = SD_MMC.open(ERROR_LOG_PATH, FILE_APPEND);
+    errorLogFile = SD.open(ERROR_LOG_PATH, FILE_APPEND);
     return static_cast<bool>(errorLogFile);
 }
 
 static void queue_can_log(const twai_message_t &message) {
-    if (!sdLoggingEnabled || canLogQueue == NULL) {
+    if (canLogQueue == NULL) {
         ++canLogDroppedFrames;
         return;
     }
 
-    CanLogRecord record = {millis(), message};
+    CanLogRecord record = {time(nullptr), millis(), message};
     if (xQueueSend(canLogQueue, &record, 0) != pdTRUE) {
         ++canLogDroppedFrames;
     }
+}
+
+static bool open_can_log_file() {
+    canLogFile = SD.open(CAN_LOG_PATH, FILE_APPEND);
+    if (!canLogFile) {
+        log_error("SD: failed to open CAN capture file");
+        return false;
+    }
+
+    char timestamp[32];
+    format_log_timestamp(time(nullptr), millis(), timestamp, sizeof(timestamp));
+    canLogFile.printf("# capture started [%s]\n", timestamp);
+    canLogFile.println("timestamp_utc,timestamp_ms,can_id,extended,dlc,data0,data1,data2,data3,data4,data5,data6,data7");
+    canLogFile.flush();
+    sdLoggingEnabled = true;
+    Serial.printf("SD: logging raw CAN frames to %s\n", CAN_LOG_PATH);
+    return true;
 }
 
 static void SDLoggerLoop(void *) {
@@ -423,6 +450,7 @@ static void SDLoggerLoop(void *) {
     unsigned long lastFlush = now;
     unsigned long lastMountAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
     unsigned long lastErrorOpenAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
+    unsigned long lastCanOpenAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
     unsigned long lastStatus = now;
     CanLogRecord record;
     ErrorLogRecord errorRecord;
@@ -443,18 +471,30 @@ static void SDLoggerLoop(void *) {
             }
 
             if (errorLogFile && xQueueReceive(errorLogQueue, &errorRecord, 0) == pdTRUE) {
-                errorLogFile.printf("%lu ms: %s\n",
-                                    static_cast<unsigned long>(errorRecord.timestampMs),
-                                    errorRecord.message);
+                char timestamp[32];
+                format_log_timestamp(errorRecord.timestamp, errorRecord.timestampMs,
+                                     timestamp, sizeof(timestamp));
+                errorLogFile.printf("[%s] %s\n", timestamp, errorRecord.message);
                 errorLogFile.flush();
             }
 
         }
 
+        if (sdCardMounted && !sdLoggingEnabled && canLogQueue != NULL &&
+            uxQueueMessagesWaiting(canLogQueue) > 0 &&
+            now - lastCanOpenAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
+            lastCanOpenAttempt = now;
+            open_can_log_file();
+        }
+
         if (sdLoggingEnabled && canLogQueue != NULL) {
             if (xQueueReceive(canLogQueue, &record, pdMS_TO_TICKS(100)) == pdTRUE) {
                 const twai_message_t &message = record.message;
-                canLogFile.printf("%lu,0x%08lX,%u,%u",
+                char timestamp[32];
+                format_log_timestamp(record.timestamp, record.timestampMs,
+                                     timestamp, sizeof(timestamp));
+                canLogFile.printf("%s,%lu,0x%08lX,%u,%u",
+                                  timestamp,
                                   record.timestampMs,
                                   static_cast<unsigned long>(message.identifier),
                                   message.extd ? 1 : 0,
@@ -724,6 +764,8 @@ void setup() {
 
     // SDMMC starts last on a low-priority task so a slow card cannot block LVGL startup.
     xTaskCreatePinnedToCore(SDLoggerLoop, "SDLogger", 4096, NULL, 0, &SDLoggerTaskHandle, 1);
+
+    //log_error("Setup complete");
 }
 
 void loop() {
