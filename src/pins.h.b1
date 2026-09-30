@@ -1,21 +1,20 @@
 #pragma once
 
 // ============================================================================
-// WAVESHARE ESP32-S3-TOUCH-LCD-4.3B HARDWARE PINOUT MAP (DO NOT ALTER)
+// WAVESHARE ESP32-S3-TOUCH-LCD-4.3B HARDWARE PINOUT MAP
 // ============================================================================
 
-// DI0 Optocoupler Terminal = GPIO 4 | DI1 Optocoupler Terminal = GPIO 5
-#define UART_RX_PIN GPIO_NUM_18  // RS485 Terminal A
-#define UART_TX_PIN GPIO_NUM_17  // RS485 Terminal B
+// --- CAN BUS (External SN65HVD230 Transceiver Bypass) ---
+// Remapped from damaged onboard TJA1051 to free IO pads:
+// - PIN_CAN_TX (1)  -> Wired to IO1 Pad -> CTX on module
+// - PIN_CAN_RX (46) -> Wired to IO46 Pad -> CRX on module
+// (Frees GPIO 20 so Native USB CDC stays continuously connected)
+#define PIN_CAN_TX          1
+#define PIN_CAN_RX          46
 
 // --- I2C BUS (PCF8563 RTC & GT911 Touch Controller) ---
 #define PIN_I2C_SDA         8
 #define PIN_I2C_SCL         9
-
-// --- SD CARD (SDMMC 1-Bit / SPI Mode) ---
-//#define PIN_SD_CLK          14
-//#define PIN_SD_CMD          11
-//#define PIN_SD_D0           13
 
 // --- SD CARD (SPI; card select is CH422G EXIO4) ---
 #define PIN_SD_CLK          12
