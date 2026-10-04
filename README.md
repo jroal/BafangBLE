@@ -4,4 +4,4 @@ I have this device: https://docs.waveshare.com/ESP32-S3-Touch-LCD-4.3B I plan to
 
 I made a T harness to connect the device at the display connector. I bought this power step-down convertor: https://www.amazon.com/dp/B0FSDSVJC1 to support this project. 
 
-I found the ESP32 does not natively support reading this Bafang UART. Ordered a PC817 module to read the UART and communicate this to input pins on the ESP32.
+I found the ESP32 does not natively support reading this Bafang UART. Ordered a PC817 module https://www.amazon.com/dp/B0FWC82QF6 to read the UART and communicate this to input pins on the ESP32.
