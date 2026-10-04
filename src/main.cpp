@@ -26,8 +26,8 @@
 // =========================================================================
 // CONFIGURATION - BAFANG UART SERIAL
 // =========================================================================
-static const gpio_num_t BAFANG_UART_RX_PIN = static_cast<gpio_num_t>(UART_RX_PIN); // GPIO 18
-static const gpio_num_t BAFANG_UART_TX_PIN = static_cast<gpio_num_t>(UART_TX_PIN); // GPIO 17
+static const gpio_num_t BAFANG_UART_RX_PIN = static_cast<gpio_num_t>(UART_RX_PIN);
+static const gpio_num_t BAFANG_UART_TX_PIN = static_cast<gpio_num_t>(UART_TX_PIN);
 
 struct UartModeConfig {
     uint32_t baud;
@@ -36,10 +36,8 @@ struct UartModeConfig {
 };
 
 static const UartModeConfig UART_MODES[] = {
-    {9600, true,  "9600 Baud (Inverted - DI0 Optocoupler)"},
-    {9600, false, "9600 Baud (Non-Inverted - Direct Logic)"},
-    {1200, true,  "1200 Baud (Inverted - DI0 Optocoupler)"},
-    {1200, false, "1200 Baud (Non-Inverted - Direct Logic)"}
+    {9600, false, "9600 Baud (RS485)"},
+    {1200, false, "1200 Baud (RS485)"}
 };
 static const size_t NUM_UART_MODES = sizeof(UART_MODES) / sizeof(UART_MODES[0]);
 
@@ -572,48 +570,67 @@ static bool apply_uart_mode(size_t modeIdx) {
     BafangSerial.begin(cfg.baud, SERIAL_8N1, BAFANG_UART_RX_PIN, BAFANG_UART_TX_PIN, cfg.invert);
     
     char buf[128];
-    snprintf(buf, sizeof(buf), "UART: Initialized Mode %u -> %s on RX Pin %d, TX Pin %d", 
+    snprintf(buf, sizeof(buf), "UART: Initialized Mode %u -> %s on RX Pin %d, TX Pin %d",
              (unsigned)modeIdx, cfg.name, (int)BAFANG_UART_RX_PIN, (int)BAFANG_UART_TX_PIN);
     log_error(buf);
     return true;
 }
 
 static bool uart_init() {
-    // Start with Mode 0 (9600 Baud, Inverted for DI0 optocoupler)
+    // Start with the standard non-inverted RS485 UART mode.
     return apply_uart_mode(0);
 }
 
-// Decodes standard Bafang UART motor telemetry frames
-static void parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
-    if (len < 3) return;
-
-    // Check headers for standard Bafang UART communication:
-    // 0x16: Display -> Motor request packet
-    // 0x52: Motor -> Display telemetry packet
-    // 0x59 / 0x3A / 0x11: Status & parameter response packets
-    uint8_t header = buf[0];
-    if (header == 0x52 || header == 0x59 || header == 0x16 || header == 0x3A || header == 0x11) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        liveData.canActive = true; // Maintain field name compatibility with dashboard UI
-
-        if (header == 0x52 && len >= 8) { // Motor telemetry packet
-            uint16_t speedRaw = static_cast<uint16_t>(buf[2]) | (static_cast<uint16_t>(buf[3]) << 8);
-            liveData.speedKmh = speedRaw * 0.1f;
-            
-            uint16_t powerRaw = static_cast<uint16_t>(buf[4]) | (static_cast<uint16_t>(buf[5]) << 8);
-            liveData.powerWatts = powerRaw;
-            
-            if (len >= 10) {
-                liveData.cadenceRpm = buf[6];
-                liveData.batterySocPercent = buf[7];
-            }
-        } else if ((header == 0x59 || header == 0x3A) && len >= 6) {
-            uint16_t powerRaw = static_cast<uint16_t>(buf[2]) | (static_cast<uint16_t>(buf[3]) << 8);
-            liveData.powerWatts = powerRaw;
-            if (len >= 7) liveData.cadenceRpm = buf[6];
-        }
-        xSemaphoreGive(dataMutex);
+// Calculate 8-bit Bafang UART checksum (sum of all preceding bytes modulo 256)
+static uint8_t calculate_bafang_checksum(const uint8_t *buf, size_t len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; i++) {
+        sum += buf[i];
     }
+    return static_cast<uint8_t>(sum & 0xFF);
+}
+
+// Decodes standard Bafang UART motor telemetry frames
+static bool parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
+    // 1. Minimum valid frame length with checksum is 4 bytes
+    if (len < 4) return false;
+
+    // 2. Validate the 8-bit Bafang checksum (last byte of frame)
+    uint8_t expectedChecksum = calculate_bafang_checksum(buf, len - 1);
+    if (buf[len - 1] != expectedChecksum) {
+        log_error("UART: Checksum mismatch, dropping frame.");
+        return false; // Drop corrupted/incomplete frame
+    }
+
+    // 3. Process valid headers
+    uint8_t header = buf[0];
+    if (header != 0x52 && header != 0x59 && header != 0x16 && header != 0x3A && header != 0x11) {
+        return false;
+    }
+    if ((header == 0x52 && len < 8) ||
+        ((header == 0x59 || header == 0x3A) && len < 6)) {
+        return false;
+    }
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (header == 0x52) { // Motor telemetry packet
+        uint16_t speedRaw = static_cast<uint16_t>(buf[1]) | (static_cast<uint16_t>(buf[2]) << 8);
+        liveData.speedKmh = speedRaw * 0.1f;
+
+        uint16_t powerRaw = static_cast<uint16_t>(buf[3]) | (static_cast<uint16_t>(buf[4]) << 8);
+        liveData.powerWatts = powerRaw;
+
+        if (len >= 10) {
+            liveData.cadenceRpm = buf[5];
+            liveData.batterySocPercent = buf[6];
+        }
+    } else if (header == 0x59 || header == 0x3A) {
+        uint16_t powerRaw = static_cast<uint16_t>(buf[1]) | (static_cast<uint16_t>(buf[2]) << 8);
+        liveData.powerWatts = powerRaw;
+        if (len >= 7) liveData.cadenceRpm = buf[5];
+    }
+    xSemaphoreGive(dataMutex);
+    return true;
 }
 
 void UARTProcessingLoop(void *pvParameters) {
@@ -649,7 +666,7 @@ void UARTProcessingLoop(void *pvParameters) {
             queue_uart_log(rxBuffer, rxIndex);
 
             // Valid frame received (more than 2 bytes)
-            if (rxIndex >= 3) {
+            if (rxIndex >= 3 && parse_bafang_uart_packet(rxBuffer, rxIndex)) {
                 xSemaphoreTake(dataMutex, portMAX_DELAY);
                 lastValidFrame = millis();
                 liveData.canActive = true;
@@ -663,7 +680,6 @@ void UARTProcessingLoop(void *pvParameters) {
                     log_error(buf);
                 }
 
-                parse_bafang_uart_packet(rxBuffer, rxIndex);
             }
 
             rxIndex = 0; // Reset buffer
@@ -720,8 +736,6 @@ void UIProcessingLoop(void *pvParameters) {
 // ENTRY POINTS
 // =========================================================================
 void setup() {
-    Serial.begin(115200);
-
     delay(1000);
 
     errorLogQueue = xQueueCreate(ERROR_LOG_QUEUE_LENGTH, sizeof(ErrorLogRecord));

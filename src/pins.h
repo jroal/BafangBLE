@@ -4,9 +4,9 @@
 // WAVESHARE ESP32-S3-TOUCH-LCD-4.3B HARDWARE PINOUT MAP (DO NOT ALTER)
 // ============================================================================
 
-// DI0 Optocoupler Terminal = GPIO 4 | DI1 Optocoupler Terminal = GPIO 5
-#define UART_RX_PIN GPIO_NUM_18  // RS485 Terminal A
-#define UART_TX_PIN GPIO_NUM_17  // RS485 Terminal B
+// Waveshare RS485 interface UART pins
+#define UART_RX_PIN GPIO_NUM_43
+#define UART_TX_PIN GPIO_NUM_44
 
 // --- I2C BUS (PCF8563 RTC & GT911 Touch Controller) ---
 #define PIN_I2C_SDA         8

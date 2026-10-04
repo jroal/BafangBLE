@@ -334,7 +334,7 @@ void create_dashboard() {
     lv_label_set_long_mode(status_label, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_align(status_label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_align(status_label, LV_ALIGN_BOTTOM_RIGHT, -12, -12);
-    lv_label_set_text(status_label, "CAN: waiting...");
+    lv_label_set_text(status_label, "UART");
 
     // Tap the clock to open the date/time setter (no RTC on this board).
     clock_label = lv_label_create(screen);
@@ -355,7 +355,6 @@ void update_dashboard(const MotorMetrics &metrics) {
     static char lastAssist[32] = "";
     static char lastBattery[32] = "";
     static char lastTemp[32] = "";
-    static char lastStatus[32] = "";
     char buf[32];
 
     snprintf(buf, sizeof(buf), "%.1f km/h", metrics.speedKmh);
@@ -370,8 +369,5 @@ void update_dashboard(const MotorMetrics &metrics) {
     set_label_if_changed(battery_label, lastBattery, sizeof(lastBattery), buf);
     snprintf(buf, sizeof(buf), "Motor temp: %d C", metrics.motorTempC);
     set_label_if_changed(temp_label, lastTemp, sizeof(lastTemp), buf);
-    snprintf(buf, sizeof(buf), "%s", metrics.canActive ? "CAN: active" : "CAN: no data");
-    set_label_if_changed(status_label, lastStatus, sizeof(lastStatus), buf);
-
     refresh_clock_label();
 }
