@@ -36,7 +36,6 @@ struct UartModeConfig {
 };
 
 static const UartModeConfig UART_MODES[] = {
-    {9600, false, "9600 Baud (RS485)"},
     {1200, false, "1200 Baud (RS485)"}
 };
 static const size_t NUM_UART_MODES = sizeof(UART_MODES) / sizeof(UART_MODES[0]);
@@ -581,58 +580,33 @@ static bool uart_init() {
     return apply_uart_mode(0);
 }
 
-// Calculate 8-bit Bafang UART checksum (sum of all preceding bytes modulo 256)
-static uint8_t calculate_bafang_checksum(const uint8_t *buf, size_t len) {
-    uint32_t sum = 0;
-    for (size_t i = 0; i < len; i++) {
-        sum += buf[i];
-    }
-    return static_cast<uint8_t>(sum & 0xFF);
-}
+// Controller reply to the display's 0x11 0x20 poll: 00 <speed> <speed+0x20>.
+// Scale calibrated from a single point (raw 197 = 16.5 mph); refine with more data.
+static constexpr float SPEED_KMH_PER_COUNT = 26.55f / 197.0f;
 
-// Decodes standard Bafang UART motor telemetry frames
+// Decodes controller replies on the display link (1200 baud). Replies carry no
+// command echo, so the battery reply is identified by following the speed reply.
 static bool parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
-    // 1. Minimum valid frame length with checksum is 4 bytes
-    if (len < 4) return false;
+    static bool expectBattery = false;
 
-    // 2. Validate the 8-bit Bafang checksum (last byte of frame)
-    uint8_t expectedChecksum = calculate_bafang_checksum(buf, len - 1);
-    if (buf[len - 1] != expectedChecksum) {
-        log_error("UART: Checksum mismatch, dropping frame.");
-        return false; // Drop corrupted/incomplete frame
+    if (len == 3 && buf[0] == 0x00 && buf[2] == static_cast<uint8_t>(buf[1] + 0x20)) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        liveData.speedKmh = buf[1] * SPEED_KMH_PER_COUNT;
+        xSemaphoreGive(dataMutex);
+        expectBattery = true;
+        return true;
     }
 
-    // 3. Process valid headers
-    uint8_t header = buf[0];
-    if (header != 0x52 && header != 0x59 && header != 0x16 && header != 0x3A && header != 0x11) {
-        return false;
-    }
-    if ((header == 0x52 && len < 8) ||
-        ((header == 0x59 || header == 0x3A) && len < 6)) {
-        return false;
+    if (expectBattery && len == 2 && buf[0] == buf[1] && buf[0] <= 100) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        liveData.batterySocPercent = buf[0];
+        xSemaphoreGive(dataMutex);
+        expectBattery = false;
+        return true;
     }
 
-    xSemaphoreTake(dataMutex, portMAX_DELAY);
-    if (header == 0x52) { // Motor telemetry packet
-        uint16_t speedRaw = static_cast<uint16_t>(buf[1]) | (static_cast<uint16_t>(buf[2]) << 8);
-        liveData.speedKmh = speedRaw * 0.1f;
-
-        uint16_t powerRaw = static_cast<uint16_t>(buf[3]) | (static_cast<uint16_t>(buf[4]) << 8);
-        liveData.powerWatts = powerRaw;
-
-        if (len >= 10) {
-            liveData.cadenceRpm = buf[5];
-            liveData.batterySocPercent = buf[6];
-        }
-    } else if (header == 0x59 || header == 0x3A) {
-        uint16_t powerRaw = static_cast<uint16_t>(buf[1]) | (static_cast<uint16_t>(buf[2]) << 8);
-        liveData.powerWatts = powerRaw;
-        if (len >= 7) liveData.cadenceRpm = buf[5];
-    }
-    xSemaphoreGive(dataMutex);
-    return true;
+    return false;
 }
-
 void UARTProcessingLoop(void *pvParameters) {
     while (!uartDriverStarted) {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -666,7 +640,7 @@ void UARTProcessingLoop(void *pvParameters) {
             queue_uart_log(rxBuffer, rxIndex);
 
             // Valid frame received (more than 2 bytes)
-            if (rxIndex >= 3 && parse_bafang_uart_packet(rxBuffer, rxIndex)) {
+            if (rxIndex >= 2 && parse_bafang_uart_packet(rxBuffer, rxIndex)) {
                 xSemaphoreTake(dataMutex, portMAX_DELAY);
                 lastValidFrame = millis();
                 liveData.canActive = true;
@@ -686,7 +660,7 @@ void UARTProcessingLoop(void *pvParameters) {
         }
 
         // Auto-scan mode switcher: if no valid multi-byte packets received after 6 seconds, try next mode
-        if (!modeLocked && (millis() - lastModeSwitch > 6000)) {
+        if (NUM_UART_MODES > 1 && !modeLocked && (millis() - lastModeSwitch > 6000)) {
             currentModeIdx = (currentModeIdx + 1) % NUM_UART_MODES;
             apply_uart_mode(currentModeIdx);
             lastModeSwitch = millis();

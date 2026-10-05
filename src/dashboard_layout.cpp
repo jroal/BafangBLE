@@ -355,6 +355,7 @@ void update_dashboard(const MotorMetrics &metrics) {
     static char lastAssist[32] = "";
     static char lastBattery[32] = "";
     static char lastTemp[32] = "";
+    static char lastStatus[32] = "";
     char buf[32];
 
     snprintf(buf, sizeof(buf), "%.1f km/h", metrics.speedKmh);
@@ -369,5 +370,7 @@ void update_dashboard(const MotorMetrics &metrics) {
     set_label_if_changed(battery_label, lastBattery, sizeof(lastBattery), buf);
     snprintf(buf, sizeof(buf), "Motor temp: %d C", metrics.motorTempC);
     set_label_if_changed(temp_label, lastTemp, sizeof(lastTemp), buf);
+    set_label_if_changed(status_label, lastStatus, sizeof(lastStatus),
+                         metrics.canActive ? "UART: Receiving" : "UART: No data");
     refresh_clock_label();
 }

@@ -5,6 +5,7 @@
 // ============================================================================
 
 // Waveshare RS485 interface UART pins
+// Waveshare RS485 interface: GPIO43 = RS485_RXD (data input), GPIO44 = RS485_TXD (data output)
 #define UART_RX_PIN GPIO_NUM_43
 #define UART_TX_PIN GPIO_NUM_44
 
