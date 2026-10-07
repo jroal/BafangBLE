@@ -1,7 +1,7 @@
 /**
  * @file lv_conf.h
  * Optimized Configuration for Waveshare ESP32-S3 4.3" Touch LCD (Type B)
- * Targeted Environment: 2023 Husqvarna 701 Enduro Dashboard
+ * Targeted Environment: Bafang BLE
  */
 
 #ifndef LV_CONF_H

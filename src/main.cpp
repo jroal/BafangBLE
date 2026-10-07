@@ -53,6 +53,7 @@ static constexpr const char *ERROR_LOG_PATH = "/error.txt";
 static constexpr UBaseType_t UART_LOG_QUEUE_LENGTH = 1024;
 static constexpr UBaseType_t ERROR_LOG_QUEUE_LENGTH = 32;
 static constexpr unsigned long SD_LOG_RETRY_INTERVAL_MS = 5000;
+static constexpr unsigned long SD_MOUNT_RETRY_INTERVAL_MS = 60000;
 
 #define BLE_SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define BLE_TELEMETRY_CHAR_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -66,7 +67,7 @@ volatile MotorMetrics liveData;
 struct BleTelemetryPacket {
     float speedKmh;
     uint16_t cadenceRpm;
-    uint16_t powerWatts;
+    uint16_t motorPowerWatts;
     uint8_t assistLevel;
     int8_t motorTempC;
     float batteryVoltage;
@@ -355,10 +356,16 @@ static bool hardware_display_init() {
 }
 
 static bool sd_log_init() {
-    uint8_t outputLevels = static_cast<uint8_t>(expander_usb_can_levels() & ~(1U << PIN_SD_CS_EXPANDER));
-    if (!expander_write_io(outputLevels)) {
-        log_error("SD: failed to preserve selected route through CH422G");
-        return false;
+    // Write the expander once: repeating the I2C write on every retry while no card is
+    // present competes with the touch/panel traffic and can glitch the backlight.
+    static bool expanderPrepared = false;
+    if (!expanderPrepared) {
+        uint8_t outputLevels = static_cast<uint8_t>(expander_usb_can_levels() & ~(1U << PIN_SD_CS_EXPANDER));
+        if (!expander_write_io(outputLevels)) {
+            log_error("SD: failed to preserve selected route through CH422G");
+            return false;
+        }
+        expanderPrepared = true;
     }
 
     if (!sdSpiStarted) {
@@ -368,7 +375,11 @@ static bool sd_log_init() {
     }
 
     if (!SD.begin(PIN_SD_DUMMY_CS, SPI, 20000000, "/sdcard", 5, false)) {
-        log_error("SD: mount failed; error and UART logging unavailable");
+        static bool mountFailureLogged = false;
+        if (!mountFailureLogged) {
+            log_error("SD: mount failed; error and UART logging unavailable");
+            mountFailureLogged = true;
+        }
         SD.end();
         return false;
     }
@@ -441,7 +452,7 @@ static void SDLoggerLoop(void *) {
 
     unsigned long now = millis();
     unsigned long lastFlush = now;
-    unsigned long lastMountAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
+    unsigned long lastMountAttempt = now - SD_MOUNT_RETRY_INTERVAL_MS;
     unsigned long lastErrorOpenAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
     unsigned long lastUartOpenAttempt = now - SD_LOG_RETRY_INTERVAL_MS;
     UartLogRecord record;
@@ -449,7 +460,7 @@ static void SDLoggerLoop(void *) {
 
     while (true) {
         now = millis();
-        if (!sdCardMounted && now - lastMountAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
+        if (!sdCardMounted && now - lastMountAttempt >= SD_MOUNT_RETRY_INTERVAL_MS) {
             lastMountAttempt = now;
             if (sd_log_init()) {
                 lastFlush = now;
@@ -542,7 +553,7 @@ static void ble_notify_telemetry() {
     BleTelemetryPacket packet = {
         liveData.speedKmh,
         liveData.cadenceRpm,
-        liveData.powerWatts,
+        liveData.motorPowerWatts,
         liveData.assistLevel,
         liveData.motorTempC,
         liveData.batteryVoltage,
@@ -583,17 +594,69 @@ static bool uart_init() {
 // Controller reply to the display's 0x11 0x20 poll: 00 <speed> <speed+0x20>.
 // Scale calibrated from a single point (raw 197 = 16.5 mph); refine with more data.
 static constexpr float SPEED_KMH_PER_COUNT = 26.55f / 197.0f;
+// Motor power reply (<n> <n>) scale from one point: peak raw 0x3C (60) at ~1500 W on 56.7 V.
+static constexpr uint16_t MOTOR_WATTS_PER_COUNT = 25;
+// Pack voltage from the 6-byte status frame <hi> <lo> 00 00 <sum> 01 (hi = 02): 56.7 V read as 0x02F4 (756).
+static constexpr float VOLTS_PER_COUNT = 56.7f / 756.0f;
 
 // Decodes controller replies on the display link (1200 baud). Replies carry no
 // command echo, so the battery reply is identified by following the speed reply.
 static bool parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
     static bool expectBattery = false;
+    static bool expectAssist = false;
+    static bool expectMotorPower = false;
+
+    if (len == 6 && buf[0] == 0x02 && buf[3] == 0x00 && buf[5] == 0x01 &&
+        static_cast<uint8_t>(buf[0] + buf[1] + buf[2] + buf[3]) == buf[4]) {
+        float volts = ((buf[0] << 8) | buf[1]) * VOLTS_PER_COUNT;
+        if (volts > 30.0f && volts < 75.0f) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            liveData.batteryVoltage = volts;
+            xSemaphoreGive(dataMutex);
+        }
+        return true;
+    }
+
+    // The 01/03 status flag precedes the motor power reply.
+    if (len == 1 && (buf[0] == 0x01 || buf[0] == 0x03)) {
+        expectMotorPower = true;
+        return true;
+    }
+
+    if (expectMotorPower && len == 2 && buf[0] == buf[1]) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        liveData.motorPowerWatts = buf[0] * MOTOR_WATTS_PER_COUNT;
+        xSemaphoreGive(dataMutex);
+        expectMotorPower = false;
+        return true;
+    }
 
     if (len == 3 && buf[0] == 0x00 && buf[2] == static_cast<uint8_t>(buf[1] + 0x20)) {
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         liveData.speedKmh = buf[1] * SPEED_KMH_PER_COUNT;
         xSemaphoreGive(dataMutex);
         expectBattery = true;
+        expectAssist = false;
+        return true;
+    }
+
+    // Assist level reply: 00 <v> <v>, where v falls as the level rises. It follows the
+    // battery reply; the odometer-like reply after it has the same shape, so gate on order.
+    if (expectAssist && len == 3 && buf[0] == 0x00 && buf[1] == buf[2]) {
+        uint8_t level = 0;
+        switch (buf[1]) {
+            case 0xFF: level = 0; break;
+            case 0x81: level = 1; break;
+            case 0x64: level = 2; break;
+            case 0x4B: level = 3; break;
+            case 0x38: level = 4; break;
+            case 0x2D: level = 5; break;
+            default: return false;
+        }
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        liveData.assistLevel = level;
+        xSemaphoreGive(dataMutex);
+        expectAssist = false;
         return true;
     }
 
@@ -602,11 +665,13 @@ static bool parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
         liveData.batterySocPercent = buf[0];
         xSemaphoreGive(dataMutex);
         expectBattery = false;
+        expectAssist = true;
         return true;
     }
 
     return false;
 }
+
 void UARTProcessingLoop(void *pvParameters) {
     while (!uartDriverStarted) {
         vTaskDelay(pdMS_TO_TICKS(100));

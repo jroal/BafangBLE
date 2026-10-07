@@ -6,7 +6,7 @@
 struct MotorMetrics {
     float speedKmh = 0.0f;
     uint16_t cadenceRpm = 0;
-    uint16_t powerWatts = 0;
+    uint16_t motorPowerWatts = 0;
     uint8_t assistLevel = 0;
     int8_t motorTempC = 0;
     float batteryVoltage = 0.0f;

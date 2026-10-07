@@ -45,7 +45,7 @@ MotorMetrics simulate_metrics(uint32_t elapsedMs) {
 
     metrics.speedKmh = 15.0f + 10.0f * sinf(t * 0.3f);
     metrics.cadenceRpm = static_cast<uint16_t>(70 + 20 * sinf(t * 0.4f));
-    metrics.powerWatts = static_cast<uint16_t>(150 + 100 * sinf(t * 0.25f));
+    metrics.motorPowerWatts = static_cast<uint16_t>(150 + 100 * sinf(t * 0.25f));
     metrics.assistLevel = static_cast<uint8_t>((static_cast<int>(t / 5) % 5));
     metrics.motorTempC = static_cast<int8_t>(35 + 5 * sinf(t * 0.05f));
     metrics.batteryVoltage = 48.0f + 1.5f * sinf(t * 0.1f);

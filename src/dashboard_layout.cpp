@@ -358,9 +358,9 @@ void update_dashboard(const MotorMetrics &metrics) {
     static char lastStatus[32] = "";
     char buf[32];
 
-    snprintf(buf, sizeof(buf), "%.1f km/h", metrics.speedKmh);
+    snprintf(buf, sizeof(buf), "%.1f mph", metrics.speedKmh * 0.621371f);
     set_label_if_changed(speed_label, lastSpeed, sizeof(lastSpeed), buf);
-    snprintf(buf, sizeof(buf), "Motor power: %u W", metrics.powerWatts);
+    snprintf(buf, sizeof(buf), "Motor power: %u W", metrics.motorPowerWatts);
     set_label_if_changed(power_label, lastPower, sizeof(lastPower), buf);
     snprintf(buf, sizeof(buf), "Pedal cadence: %u RPM", metrics.cadenceRpm);
     set_label_if_changed(cadence_label, lastCadence, sizeof(lastCadence), buf);
