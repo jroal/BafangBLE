@@ -366,7 +366,11 @@ void update_dashboard(const MotorMetrics &metrics) {
     set_label_if_changed(cadence_label, lastCadence, sizeof(lastCadence), buf);
     snprintf(buf, sizeof(buf), "Assist %u", metrics.assistLevel);
     set_label_if_changed(assist_label, lastAssist, sizeof(lastAssist), buf);
-    snprintf(buf, sizeof(buf), "Battery: %u%% / %.1fV", metrics.batterySocPercent, metrics.batteryVoltage);
+    if (metrics.batteryVoltage > 0.0f) {
+        snprintf(buf, sizeof(buf), "Battery: %u%% / %.1fV", metrics.batterySocPercent, metrics.batteryVoltage);
+    } else {
+        snprintf(buf, sizeof(buf), "Battery: %u%%", metrics.batterySocPercent);
+    }
     set_label_if_changed(battery_label, lastBattery, sizeof(lastBattery), buf);
     snprintf(buf, sizeof(buf), "Motor temp: %d C", metrics.motorTempC);
     set_label_if_changed(temp_label, lastTemp, sizeof(lastTemp), buf);

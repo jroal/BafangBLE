@@ -596,8 +596,6 @@ static bool uart_init() {
 static constexpr float SPEED_KMH_PER_COUNT = 26.55f / 197.0f;
 // Motor power reply (<n> <n>) scale from one point: peak raw 0x3C (60) at ~1500 W on 56.7 V.
 static constexpr uint16_t MOTOR_WATTS_PER_COUNT = 25;
-// Pack voltage from the 6-byte status frame <hi> <lo> 00 00 <sum> 01 (hi = 02): 56.7 V read as 0x02F4 (756).
-static constexpr float VOLTS_PER_COUNT = 56.7f / 756.0f;
 
 // Decodes controller replies on the display link (1200 baud). Replies carry no
 // command echo, so the battery reply is identified by following the speed reply.
@@ -605,17 +603,6 @@ static bool parse_bafang_uart_packet(const uint8_t *buf, size_t len) {
     static bool expectBattery = false;
     static bool expectAssist = false;
     static bool expectMotorPower = false;
-
-    if (len == 6 && buf[0] == 0x02 && buf[3] == 0x00 && buf[5] == 0x01 &&
-        static_cast<uint8_t>(buf[0] + buf[1] + buf[2] + buf[3]) == buf[4]) {
-        float volts = ((buf[0] << 8) | buf[1]) * VOLTS_PER_COUNT;
-        if (volts > 30.0f && volts < 75.0f) {
-            xSemaphoreTake(dataMutex, portMAX_DELAY);
-            liveData.batteryVoltage = volts;
-            xSemaphoreGive(dataMutex);
-        }
-        return true;
-    }
 
     // The 01/03 status flag precedes the motor power reply.
     if (len == 1 && (buf[0] == 0x01 || buf[0] == 0x03)) {
@@ -705,7 +692,7 @@ void UARTProcessingLoop(void *pvParameters) {
             queue_uart_log(rxBuffer, rxIndex);
 
             // Valid frame received (more than 2 bytes)
-            if (rxIndex >= 2 && parse_bafang_uart_packet(rxBuffer, rxIndex)) {
+            if (rxIndex >= 1 && parse_bafang_uart_packet(rxBuffer, rxIndex)) {
                 xSemaphoreTake(dataMutex, portMAX_DELAY);
                 lastValidFrame = millis();
                 liveData.canActive = true;
