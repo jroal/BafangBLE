@@ -298,6 +298,14 @@ void create_dashboard() {
     lv_style_init(&style_metric);
     lv_style_set_text_font(&style_metric, &lv_font_montserrat_48);
 
+    static lv_style_t style_emphasis;
+    lv_style_init(&style_emphasis);
+    lv_style_set_text_font(&style_emphasis, &lv_font_montserrat_32);
+    lv_style_set_text_color(&style_emphasis, lv_color_hex(0x65D6FF));
+    lv_style_set_text_outline_stroke_color(&style_emphasis, lv_color_hex(0x65D6FF));
+    lv_style_set_text_outline_stroke_opa(&style_emphasis, LV_OPA_COVER);
+    lv_style_set_text_outline_stroke_width(&style_emphasis, 1);
+
     speed_label = lv_label_create(screen);
     lv_obj_add_style(speed_label, &style_metric, 0);
     lv_obj_align(speed_label, LV_ALIGN_CENTER, 0, -150);
@@ -305,8 +313,9 @@ void create_dashboard() {
 
     power_label = lv_label_create(screen);
     lv_obj_add_style(power_label, &style_header, 0);
+    lv_obj_add_style(power_label, &style_emphasis, 0);
     lv_obj_align(power_label, LV_ALIGN_CENTER, 0, -45);
-        lv_label_set_text(power_label, "Motor power: 0 W");
+    lv_label_set_text(power_label, "Motor power: 0 W");
 
     cadence_label = lv_label_create(screen);
     lv_obj_add_style(cadence_label, &style_header, 0);
@@ -315,11 +324,13 @@ void create_dashboard() {
 
     assist_label = lv_label_create(screen);
     lv_obj_add_style(assist_label, &style_header, 0);
+    lv_obj_add_style(assist_label, &style_emphasis, 0);
     lv_obj_align(assist_label, LV_ALIGN_CENTER, 0, -5);
     lv_label_set_text(assist_label, "Assist 0");
 
     battery_label = lv_label_create(screen);
     lv_obj_add_style(battery_label, &style_header, 0);
+    lv_obj_add_style(battery_label, &style_emphasis, 0);
     lv_obj_align(battery_label, LV_ALIGN_CENTER, 0, 75);
     lv_label_set_text(battery_label, "Battery: 0% / 0.0V");
 

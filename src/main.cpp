@@ -48,7 +48,7 @@ static constexpr uint8_t PCF85063A_CTRL1_REGISTER = 0x00;
 static constexpr uint8_t PCF85063A_SECONDS_REGISTER = 0x04;
 static constexpr int PCF85063A_YEAR_OFFSET = 1970;
 static constexpr uint8_t CH422G_IO_WRITE_ADDRESS = 0x38;
-static constexpr const char *UART_LOG_PATH = "/uart_capture.csv";
+static constexpr size_t UART_LOG_PATH_BUFFER_SIZE = 48;
 static constexpr const char *ERROR_LOG_PATH = "/error.txt";
 static constexpr UBaseType_t UART_LOG_QUEUE_LENGTH = 1024;
 static constexpr UBaseType_t ERROR_LOG_QUEUE_LENGTH = 32;
@@ -423,8 +423,55 @@ static void queue_uart_log(const uint8_t *data, size_t len) {
     }
 }
 
+static bool build_uart_log_path(time_t createdAt, char *path, size_t pathSize) {
+    if (createdAt <= 0) {
+        log_error("SD: system time unavailable; cannot name UART capture file");
+        return false;
+    }
+
+    struct tm createdTime;
+    if (localtime_r(&createdAt, &createdTime) == nullptr) {
+        log_error("SD: failed to convert time for UART capture filename");
+        return false;
+    }
+
+    char timePart[16];
+    if (strftime(timePart, sizeof(timePart), "%m%d%Y_%H%M", &createdTime) == 0) {
+        log_error("SD: failed to format UART capture filename");
+        return false;
+    }
+
+    int pathLength = snprintf(path, pathSize, "/uart%s.csv", timePart);
+    if (pathLength < 0 || static_cast<size_t>(pathLength) >= pathSize) {
+        log_error("SD: UART capture filename is too long");
+        return false;
+    }
+
+    uint32_t suffix = 1;
+    while (SD.exists(path)) {
+        pathLength = snprintf(path, pathSize, "/uart%s_%lu.csv", timePart,
+                              static_cast<unsigned long>(suffix));
+        if (pathLength < 0 || static_cast<size_t>(pathLength) >= pathSize) {
+            log_error("SD: UART capture filename is too long");
+            return false;
+        }
+        if (suffix == UINT32_MAX) {
+            log_error("SD: no unique UART capture filename is available");
+            return false;
+        }
+        ++suffix;
+    }
+
+    return true;
+}
+
 static bool open_uart_log_file() {
-    uartLogFile = SD.open(UART_LOG_PATH, FILE_APPEND);
+    char path[UART_LOG_PATH_BUFFER_SIZE];
+    if (!build_uart_log_path(time(nullptr), path, sizeof(path))) {
+        return false;
+    }
+
+    uartLogFile = SD.open(path, FILE_WRITE);
     if (!uartLogFile) {
         log_error("SD: failed to open UART capture file");
         return false;
@@ -483,7 +530,6 @@ static void SDLoggerLoop(void *) {
         }
 
         if (sdCardMounted && !sdLoggingEnabled && uartLogQueue != NULL &&
-            uxQueueMessagesWaiting(uartLogQueue) > 0 &&
             now - lastUartOpenAttempt >= SD_LOG_RETRY_INTERVAL_MS) {
             lastUartOpenAttempt = now;
             open_uart_log_file();
